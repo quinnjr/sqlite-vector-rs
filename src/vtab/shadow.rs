@@ -65,9 +65,7 @@ impl ShadowOps {
     }
 
     pub fn upsert_index_sql(table_name: &str) -> String {
-        format!(
-            "INSERT OR REPLACE INTO \"{table_name}_index\"(key, value) VALUES(?, ?)"
-        )
+        format!("INSERT OR REPLACE INTO \"{table_name}_index\"(key, value) VALUES(?, ?)")
     }
 
     pub fn select_index_sql(table_name: &str) -> String {

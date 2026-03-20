@@ -24,9 +24,8 @@ const QUERY_VECTOR_JSON: &str = "[1,2,3,5]";
 fn run_combination(vec_type: &str, metric: &str) {
     let conn = open_with_extension();
 
-    let create_sql = format!(
-        "CREATE VIRTUAL TABLE emb USING vector(dim=4, type={vec_type}, metric={metric})"
-    );
+    let create_sql =
+        format!("CREATE VIRTUAL TABLE emb USING vector(dim=4, type={vec_type}, metric={metric})");
     conn.execute_batch(&create_sql)
         .unwrap_or_else(|e| panic!("CREATE failed for ({vec_type}, {metric}): {e}"));
 
@@ -44,9 +43,7 @@ fn run_combination(vec_type: &str, metric: &str) {
             [],
             |row| row.get(0),
         )
-        .unwrap_or_else(|e| {
-            panic!("vector_from_json failed for ({vec_type}, {metric}): {e}")
-        });
+        .unwrap_or_else(|e| panic!("vector_from_json failed for ({vec_type}, {metric}): {e}"));
 
     // KNN search: expect exactly 1 result (we only inserted 1 vector).
     let mut stmt = conn

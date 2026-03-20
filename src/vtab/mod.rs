@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use sqlite3_ext::query::ToParam;
 use sqlite3_ext::vtab::{
-    ChangeInfo, ChangeType, ConstraintOp, CreateVTab, DisconnectResult, IndexInfo, TransactionVTab,
-    UpdateVTab, VTab, VTabConnection,
+    ChangeInfo, ChangeType, ConstraintOp, CreateVTab, DisconnectResult, FindFunctionVTab,
+    IndexInfo, TransactionVTab, UpdateVTab, VTab, VTabConnection, VTabFunctionList,
 };
-use sqlite3_ext::{Error, FromValue, Result, ValueRef, SQLITE_EMPTY};
+use sqlite3_ext::{Error, FromValue, Result, SQLITE_EMPTY, ValueRef, function::Context};
 
 use crate::index::HnswIndex;
 use crate::vtab::config::VectorTableConfig;
@@ -28,27 +28,25 @@ const INDEX_KNN: i32 = 1;
 /// `db` is a raw pointer to the VTabConnection that SQLite provides to connect/create.
 /// SQLite guarantees the connection outlives the virtual table, so this pointer is valid
 /// for the entire lifetime of VectorTable.
-pub struct VectorTable {
+pub struct VectorTable<'vtab> {
     config: VectorTableConfig,
     state: Arc<RefCell<IndexState>>,
     /// Safety: valid for 'vtab lifetime — SQLite keeps the connection alive.
     db: *const VTabConnection,
+    functions: VTabFunctionList<'vtab, Self>,
 }
 
 // Safety: VectorTable is only ever accessed from a single thread by SQLite's
 // virtual table machinery.
-unsafe impl Send for VectorTable {}
-unsafe impl Sync for VectorTable {}
+unsafe impl Send for VectorTable<'_> {}
+unsafe impl Sync for VectorTable<'_> {}
 
 // ---------------------------------------------------------------------------
 // Shadow table I/O stubs — wired up in Task 13
 // ---------------------------------------------------------------------------
 
 /// Load the serialized HNSW index blob from the `_index` shadow table, if present.
-fn load_index_from_shadow(
-    db: &VTabConnection,
-    table_name: &str,
-) -> Result<Option<Vec<u8>>> {
+fn load_index_from_shadow(db: &VTabConnection, table_name: &str) -> Result<Option<Vec<u8>>> {
     let sql = ShadowOps::select_index_sql(table_name);
     match db.query_row(&sql, ["hnsw_graph"], |row| {
         let blob = row[0].get_blob()?;
@@ -62,11 +60,7 @@ fn load_index_from_shadow(
 
 /// Persist schema/config metadata to the `_index` shadow table.
 #[allow(dead_code)]
-fn save_meta_to_shadow(
-    db: &VTabConnection,
-    table_name: &str,
-    meta_json: &str,
-) -> Result<()> {
+fn save_meta_to_shadow(db: &VTabConnection, table_name: &str, meta_json: &str) -> Result<()> {
     let sql = ShadowOps::upsert_index_sql(table_name);
     db.execute(&sql, ["meta", meta_json])?;
     Ok(())
@@ -114,12 +108,8 @@ fn update_data_shadow(
 // Shared init logic used by both connect and create
 // ---------------------------------------------------------------------------
 
-fn init(
-    db: &VTabConnection,
-    args: &[&str],
-) -> Result<(String, VectorTable)> {
-    let config = VectorTableConfig::parse(args)
-        .map_err(|e| Error::Module(e.to_string()))?;
+fn init<'vtab>(db: &VTabConnection, args: &[&str]) -> Result<(String, VectorTable<'vtab>)> {
+    let config = VectorTableConfig::parse(args).map_err(|e| Error::Module(e.to_string()))?;
 
     let schema = config.vtab_schema();
 
@@ -152,10 +142,23 @@ fn init(
         last_committed: None,
     }));
 
+    let functions = VTabFunctionList::default();
+    // Register knn_match as a 2-arg overloaded function (col, param).
+    // ConstraintOp::Function(0) tells best_index this function can act as a constraint.
+    // The function body is a no-op returning 1 because set_omit(true) in best_index
+    // prevents SQLite from evaluating it; the real work happens in filter().
+    functions.add(
+        2,
+        "knn_match",
+        Some(ConstraintOp::Function(150)),
+        |ctx: &Context, _args: &mut [&mut ValueRef]| ctx.set_result(1i32),
+    );
+
     let vtab = VectorTable {
         config,
         state,
         db: db as *const VTabConnection,
+        functions,
     };
 
     Ok((schema, vtab))
@@ -165,7 +168,7 @@ fn init(
 // VTab impl
 // ---------------------------------------------------------------------------
 
-impl<'vtab> VTab<'vtab> for VectorTable {
+impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
     type Aux = ();
     type Cursor = VectorCursor;
 
@@ -190,11 +193,19 @@ impl<'vtab> VTab<'vtab> for VectorTable {
             }
             if c.column() == distance_col {
                 if let ConstraintOp::Function(_) = c.op() {
-                    // This is the knn_match(vector, k) function constraint
+                    // knn_match(distance_col, query_blob): query_blob passed to filter
                     c.set_argv_index(Some(argv_next - 1));
                     c.set_omit(true);
                     argv_next += 1;
                     found_knn = true;
+                }
+            }
+            // Capture LIMIT as the k parameter for KNN searches
+            if let ConstraintOp::Limit = c.op() {
+                if found_knn {
+                    c.set_argv_index(Some(argv_next - 1));
+                    c.set_omit(true);
+                    argv_next += 1;
                 }
             }
         }
@@ -230,7 +241,7 @@ impl<'vtab> VTab<'vtab> for VectorTable {
 // CreateVTab impl
 // ---------------------------------------------------------------------------
 
-impl<'vtab> CreateVTab<'vtab> for VectorTable {
+impl<'vtab> CreateVTab<'vtab> for VectorTable<'vtab> {
     const SHADOW_NAMES: &'static [&'static str] = &["data", "index"];
 
     fn create(
@@ -264,7 +275,7 @@ impl<'vtab> CreateVTab<'vtab> for VectorTable {
 // UpdateVTab impl
 // ---------------------------------------------------------------------------
 
-impl<'vtab> UpdateVTab<'vtab> for VectorTable {
+impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
     fn update(&'vtab self, info: &mut ChangeInfo) -> Result<i64> {
         // Safety: db pointer is valid for 'vtab lifetime.
         let db = unsafe { &*self.db };
@@ -294,15 +305,16 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable {
                 let meta_args = &mut args[3..3 + num_meta];
 
                 // Validate dimension and finiteness before inserting
-                self.config.vtype
+                self.config
+                    .vtype
                     .validate_blob(&vector_blob, self.config.dim)
                     .map_err(|e| Error::Module(e.to_string()))?;
-                self.config.vtype
+                self.config
+                    .vtype
                     .validate_finite(&vector_blob, self.config.dim)
                     .map_err(|e| Error::Module(e.to_string()))?;
 
-                let rowid =
-                    insert_into_data_shadow(db, &self.config, &vector_blob, meta_args)?;
+                let rowid = insert_into_data_shadow(db, &self.config, &vector_blob, meta_args)?;
 
                 let state = self.state.borrow();
                 state
@@ -347,7 +359,7 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable {
 // TransactionVTab impl
 // ---------------------------------------------------------------------------
 
-impl<'vtab> TransactionVTab<'vtab> for VectorTable {
+impl<'vtab> TransactionVTab<'vtab> for VectorTable<'vtab> {
     type Transaction = VectorTransaction;
 
     fn begin(&'vtab self) -> Result<Self::Transaction> {
@@ -359,3 +371,12 @@ impl<'vtab> TransactionVTab<'vtab> for VectorTable {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FindFunctionVTab impl
+// ---------------------------------------------------------------------------
+
+impl<'vtab> FindFunctionVTab<'vtab> for VectorTable<'vtab> {
+    fn functions(&'vtab self) -> &'vtab VTabFunctionList<'vtab, Self> {
+        &self.functions
+    }
+}

@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use sqlite3_ext::query::ToParam;
-use sqlite3_ext::{Error, Result};
 use sqlite3_ext::vtab::VTabConnection;
+use sqlite3_ext::{Error, Result};
 
 use crate::index::HnswIndex;
 use crate::vtab::shadow::ShadowOps;

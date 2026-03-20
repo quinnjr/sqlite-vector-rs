@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use sqlite3_ext::{
-    vtab::{ColumnContext, VTabCursor, VTabConnection},
     Error, FallibleIteratorMut, FromValue, Result, ValueRef,
+    vtab::{ColumnContext, VTabConnection, VTabCursor},
 };
 
 use crate::vtab::config::VectorTableConfig;
@@ -110,16 +110,20 @@ impl VTabCursor for VectorCursor {
 
         match index_num {
             INDEX_KNN => {
-                // args[0] encodes the query blob (from knn_match constraint)
-                // args[0] = query vector blob
-                // args[1] = k (number of results)
-                if args.len() < 2 {
+                // args[0] = query vector blob (from knn_match function constraint)
+                // args[1] = k (from LIMIT clause, if present)
+                if args.is_empty() {
                     return Err(Error::Module(
-                        "knn_match requires query vector and k arguments".into(),
+                        "knn_match requires a query vector argument".into(),
                     ));
                 }
                 let query_blob = args[0].get_blob()?.to_vec();
-                let k = args[1].get_i64() as usize;
+                let k = if args.len() > 1 {
+                    args[1].get_i64() as usize
+                } else {
+                    // Default k when no LIMIT is specified
+                    100
+                };
 
                 let state = self.state.borrow();
                 let hits = state
@@ -212,7 +216,11 @@ fn scan_all_rows(db: &VTabConnection, config: &VectorTableConfig) -> Result<Vec<
                 metadata.push(Some(row[2 + i].get_blob()?.to_vec()));
             }
         }
-        rows.push(ScanRow { id, vector, metadata });
+        rows.push(ScanRow {
+            id,
+            vector,
+            metadata,
+        });
     }
     Ok(rows)
 }
@@ -236,7 +244,11 @@ fn fetch_row_by_id(
                 metadata.push(Some(row[2 + i].get_blob()?.to_vec()));
             }
         }
-        Ok(ScanRow { id, vector, metadata })
+        Ok(ScanRow {
+            id,
+            vector,
+            metadata,
+        })
     }) {
         Ok(row) => Ok(Some(row)),
         Err(ref e) if *e == SQLITE_EMPTY => Ok(None),

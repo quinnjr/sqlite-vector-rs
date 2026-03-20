@@ -1,8 +1,8 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch};
 use arrow_array::*;
+use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
@@ -42,15 +42,15 @@ pub fn vectors_to_arrow_ipc(
         list_array.data_type().clone(),
         false,
     )]);
-    let batch = RecordBatch::try_new(
-        Arc::new(schema.clone()),
-        vec![Arc::new(list_array)],
-    ).map_err(|e| ArrowError(e.to_string()))?;
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(list_array)])
+        .map_err(|e| ArrowError(e.to_string()))?;
 
     let mut buf = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut buf, &schema)
+    let mut writer =
+        StreamWriter::try_new(&mut buf, &schema).map_err(|e| ArrowError(e.to_string()))?;
+    writer
+        .write(&batch)
         .map_err(|e| ArrowError(e.to_string()))?;
-    writer.write(&batch).map_err(|e| ArrowError(e.to_string()))?;
     writer.finish().map_err(|e| ArrowError(e.to_string()))?;
     drop(writer);
 
@@ -72,7 +72,8 @@ pub fn arrow_ipc_to_vectors(
     let mut all_blobs = Vec::new();
     for batch_result in reader {
         let batch = batch_result.map_err(|e| ArrowError(e.to_string()))?;
-        let list_col = batch.column(0)
+        let list_col = batch
+            .column(0)
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
             .ok_or_else(|| ArrowError("expected FixedSizeListArray".into()))?;
@@ -159,37 +160,49 @@ fn extract_blob_from_array(
 ) -> Result<Vec<u8>, ArrowError> {
     match vtype {
         VectorType::Float4 => {
-            let a = array.as_any().downcast_ref::<Float32Array>()
+            let a = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
                 .ok_or_else(|| ArrowError("expected Float32Array".into()))?;
             let values: Vec<f32> = (0..dim).map(|i| a.value(i)).collect();
             Ok(vtype.slice_to_blob(&values))
         }
         VectorType::Float8 => {
-            let a = array.as_any().downcast_ref::<Float64Array>()
+            let a = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
                 .ok_or_else(|| ArrowError("expected Float64Array".into()))?;
             let values: Vec<f64> = (0..dim).map(|i| a.value(i)).collect();
             Ok(vtype.slice_to_blob(&values))
         }
         VectorType::Float2 => {
-            let a = array.as_any().downcast_ref::<Float16Array>()
+            let a = array
+                .as_any()
+                .downcast_ref::<Float16Array>()
                 .ok_or_else(|| ArrowError("expected Float16Array".into()))?;
             let values: Vec<half::f16> = (0..dim).map(|i| a.value(i)).collect();
             Ok(vtype.slice_to_blob(&values))
         }
         VectorType::Int1 => {
-            let a = array.as_any().downcast_ref::<Int8Array>()
+            let a = array
+                .as_any()
+                .downcast_ref::<Int8Array>()
                 .ok_or_else(|| ArrowError("expected Int8Array".into()))?;
             let values: Vec<i8> = (0..dim).map(|i| a.value(i)).collect();
             Ok(vtype.slice_to_blob(&values))
         }
         VectorType::Int2 => {
-            let a = array.as_any().downcast_ref::<Int16Array>()
+            let a = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
                 .ok_or_else(|| ArrowError("expected Int16Array".into()))?;
             let values: Vec<i16> = (0..dim).map(|i| a.value(i)).collect();
             Ok(vtype.slice_to_blob(&values))
         }
         VectorType::Int4 => {
-            let a = array.as_any().downcast_ref::<Int32Array>()
+            let a = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
                 .ok_or_else(|| ArrowError("expected Int32Array".into()))?;
             let values: Vec<i32> = (0..dim).map(|i| a.value(i)).collect();
             Ok(vtype.slice_to_blob(&values))
