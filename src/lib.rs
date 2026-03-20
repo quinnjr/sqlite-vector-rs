@@ -4,6 +4,7 @@ pub mod distance;
 pub mod index;
 pub mod vtab;
 pub mod scalar;
+pub mod arrow_io;
 
 #[cfg(feature = "loadable_extension")]
 use sqlite3_ext::*;
