@@ -23,6 +23,10 @@ bytemuck = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.39", features = ["bundled", "vtab"], optional = true }
 
+[[bin]]
+name = "sqlite3"
+required-features = ["library"]
+
 [dev-dependencies]
 rusqlite = { version = "0.39", features = ["bundled", "vtab"] }
 rand = "0.9"
