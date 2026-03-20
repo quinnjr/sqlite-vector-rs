@@ -151,7 +151,7 @@ fn import_arrow_empty_blob() {
 }
 
 #[test]
-fn rebuild_index_then_knn_search() {
+fn rebuild_index_preserves_shadow_data() {
     let conn = open_with_extension();
     conn.execute_batch(
         "CREATE VIRTUAL TABLE emb USING vector(dim=3, type=float4, metric=l2)"

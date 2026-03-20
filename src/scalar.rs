@@ -108,6 +108,10 @@ pub fn register_scalar_functions(db: &Connection) -> Result<()> {
     // Reads all vectors from the shadow data table, builds a fresh HNSW index,
     // and serializes it back to the shadow index table. Returns the number of
     // vectors indexed.
+    //
+    // NOTE: This writes directly to shadow tables, bypassing the vtab's
+    // in-memory index. A running vtab won't see the rebuilt index until
+    // reconnect. Intended for offline maintenance, not live use.
     db.create_scalar_function(
         "vector_rebuild_index",
         &FunctionOptions::default().set_n_args(3),
@@ -215,6 +219,10 @@ pub fn register_scalar_functions(db: &Connection) -> Result<()> {
     //
     // Imports vectors from an Arrow IPC blob into the shadow data table,
     // adding one row per vector. Returns the number of rows inserted.
+    // Only inserts the vector column; metadata columns get NULL defaults.
+    //
+    // NOTE: Inserts directly into the shadow table, bypassing the in-memory
+    // HNSW index. Call vector_rebuild_index afterwards to sync the index.
     db.create_scalar_function(
         "vector_insert_arrow",
         &FunctionOptions::default().set_n_args(3),
@@ -242,11 +250,7 @@ pub fn register_scalar_functions(db: &Connection) -> Result<()> {
             }
 
             let db = ctx.db();
-            // Insert each vector blob as a new row. The insert SQL for a bare
-            // data table (no metadata columns) is just INSERT INTO "T_data"(vector) VALUES(?).
-            let insert_sql = format!(
-                "INSERT INTO \"{table_name}_data\"(vector) VALUES(?)"
-            );
+            let insert_sql = ShadowOps::insert_vector_only_sql(&table_name);
             for blob in &blobs {
                 db.insert(&insert_sql, [blob.as_slice()])?;
             }

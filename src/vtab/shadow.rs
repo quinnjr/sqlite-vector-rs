@@ -48,6 +48,10 @@ impl ShadowOps {
         )
     }
 
+    pub fn insert_vector_only_sql(table_name: &str) -> String {
+        format!("INSERT INTO \"{table_name}_data\"(vector) VALUES(?)")
+    }
+
     pub fn delete_data_sql(table_name: &str) -> String {
         format!("DELETE FROM \"{table_name}_data\" WHERE id = ?")
     }
