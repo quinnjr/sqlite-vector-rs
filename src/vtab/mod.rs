@@ -1,2 +1,365 @@
 pub mod config;
+pub mod cursor;
 pub mod shadow;
+pub mod transaction;
+
+use std::cell::RefCell;
+use std::sync::Arc;
+
+use sqlite3_ext::vtab::{
+    ChangeInfo, ChangeType, ConstraintOp, CreateVTab, DisconnectResult, IndexInfo, TransactionVTab,
+    UpdateVTab, VTab, VTabConnection,
+};
+use sqlite3_ext::{Error, FromValue, Result, ValueRef};
+
+use crate::index::HnswIndex;
+use crate::vtab::config::VectorTableConfig;
+use crate::vtab::cursor::{CursorMode, KnnRow, ScanRow, VectorCursor};
+use crate::vtab::shadow::ShadowOps;
+use crate::vtab::transaction::{IndexState, VectorTransaction};
+
+// Index numbers passed via best_index -> filter
+const INDEX_SCAN: i32 = 0;
+const INDEX_KNN: i32 = 1;
+
+/// The virtual table implementation for vector search.
+///
+/// `db` is a raw pointer to the VTabConnection that SQLite provides to connect/create.
+/// SQLite guarantees the connection outlives the virtual table, so this pointer is valid
+/// for the entire lifetime of VectorTable.
+pub struct VectorTable {
+    config: VectorTableConfig,
+    state: Arc<RefCell<IndexState>>,
+    /// Safety: valid for 'vtab lifetime — SQLite keeps the connection alive.
+    db: *const VTabConnection,
+}
+
+// Safety: VectorTable is only ever accessed from a single thread by SQLite's
+// virtual table machinery.
+unsafe impl Send for VectorTable {}
+unsafe impl Sync for VectorTable {}
+
+// ---------------------------------------------------------------------------
+// Shadow table I/O stubs — wired up in Task 13
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+/// Load the serialized HNSW index blob from the `_index` shadow table, if present.
+fn load_index_from_shadow(
+    _db: &VTabConnection,
+    _table_name: &str,
+) -> Result<Option<Vec<u8>>> {
+    todo!("Task 13: load index from shadow table")
+}
+
+#[allow(dead_code)]
+/// Persist schema/config metadata to the `_index` shadow table.
+fn save_meta_to_shadow(
+    _db: &VTabConnection,
+    _table_name: &str,
+    _meta_json: &str,
+) -> Result<()> {
+    todo!("Task 13: save meta to shadow table")
+}
+
+/// Insert a new row into `_data` and return the auto-assigned rowid.
+fn insert_into_data_shadow(
+    _db: &VTabConnection,
+    _config: &VectorTableConfig,
+    _vector_blob: &[u8],
+    _metadata_args: &mut [&mut ValueRef],
+) -> Result<i64> {
+    todo!("Task 13: insert into data shadow table")
+}
+
+/// Delete a row from `_data` by rowid.
+fn delete_from_data_shadow(_db: &VTabConnection, _table_name: &str, _rowid: i64) -> Result<()> {
+    todo!("Task 13: delete from data shadow table")
+}
+
+/// Update an existing row in `_data`.
+fn update_data_shadow(
+    _db: &VTabConnection,
+    _config: &VectorTableConfig,
+    _rowid: i64,
+    _vector_blob: &[u8],
+    _metadata_args: &mut [&mut ValueRef],
+) -> Result<()> {
+    todo!("Task 13: update data shadow table")
+}
+
+#[allow(dead_code)]
+/// Perform a full table scan and return all rows from `_data`.
+fn scan_all_rows(
+    _db: &VTabConnection,
+    _config: &VectorTableConfig,
+) -> Result<Vec<ScanRow>> {
+    todo!("Task 13: scan all rows from data shadow table")
+}
+
+#[allow(dead_code)]
+/// Fetch a single row from `_data` by rowid.
+fn fetch_row_by_id(
+    _db: &VTabConnection,
+    _config: &VectorTableConfig,
+    _id: i64,
+) -> Result<Option<ScanRow>> {
+    todo!("Task 13: fetch row by id from data shadow table")
+}
+
+// ---------------------------------------------------------------------------
+// Shared init logic used by both connect and create
+// ---------------------------------------------------------------------------
+
+fn init(
+    db: &VTabConnection,
+    args: &[&str],
+) -> Result<(String, VectorTable)> {
+    let config = VectorTableConfig::parse(args)
+        .map_err(|e| Error::Module(e.to_string()))?;
+
+    let schema = config.vtab_schema();
+
+    // Try to reload a previously persisted index; fall back to a fresh one.
+    let index = match load_index_from_shadow(db, &config.table_name) {
+        Ok(Some(buf)) => {
+            let idx = HnswIndex::new(
+                config.dim,
+                config.vtype,
+                config.metric,
+                Some(config.hnsw_params),
+            )
+            .map_err(|e| Error::Module(e.to_string()))?;
+            idx.load_from_buffer(&buf)
+                .map_err(|e| Error::Module(e.to_string()))?;
+            idx
+        }
+        _ => HnswIndex::new(
+            config.dim,
+            config.vtype,
+            config.metric,
+            Some(config.hnsw_params),
+        )
+        .map_err(|e| Error::Module(e.to_string()))?,
+    };
+
+    let state = Arc::new(RefCell::new(IndexState {
+        index,
+        dirty: false,
+        last_committed: None,
+    }));
+
+    let vtab = VectorTable {
+        config,
+        state,
+        db: db as *const VTabConnection,
+    };
+
+    Ok((schema, vtab))
+}
+
+// ---------------------------------------------------------------------------
+// VTab impl
+// ---------------------------------------------------------------------------
+
+impl<'vtab> VTab<'vtab> for VectorTable {
+    type Aux = ();
+    type Cursor = VectorCursor;
+
+    fn connect(
+        db: &'vtab VTabConnection,
+        _aux: &'vtab Self::Aux,
+        args: &[&str],
+    ) -> Result<(String, Self)> {
+        init(db, args)
+    }
+
+    fn best_index(&'vtab self, info: &mut IndexInfo) -> Result<()> {
+        // Distance column index = 2 + num_metadata_cols
+        let distance_col = (2 + self.config.metadata_columns.len()) as i32;
+
+        let mut found_knn = false;
+        let mut argv_next: u32 = 1;
+
+        for mut c in info.constraints() {
+            if !c.usable() {
+                continue;
+            }
+            if c.column() == distance_col {
+                if let ConstraintOp::Function(_) = c.op() {
+                    // This is the knn_match(vector, k) function constraint
+                    c.set_argv_index(Some(argv_next - 1));
+                    c.set_omit(true);
+                    argv_next += 1;
+                    found_knn = true;
+                }
+            }
+        }
+
+        if found_knn {
+            info.set_index_num(INDEX_KNN);
+            info.set_estimated_cost(10.0);
+            info.set_estimated_rows(10);
+        } else {
+            info.set_index_num(INDEX_SCAN);
+            info.set_estimated_cost(1_000_000.0);
+            info.set_estimated_rows(1_000_000);
+        }
+
+        Ok(())
+    }
+
+    fn open(&'vtab self) -> Result<Self::Cursor> {
+        Ok(VectorCursor {
+            mode: CursorMode::Scan {
+                rows: Vec::new(),
+                pos: 0,
+            },
+            num_metadata_cols: self.config.metadata_columns.len(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CreateVTab impl
+// ---------------------------------------------------------------------------
+
+impl<'vtab> CreateVTab<'vtab> for VectorTable {
+    const SHADOW_NAMES: &'static [&'static str] = &["data", "index"];
+
+    fn create(
+        db: &'vtab VTabConnection,
+        aux: &'vtab Self::Aux,
+        args: &[&str],
+    ) -> Result<(String, Self)> {
+        let (schema, vtab) = init(db, args)?;
+
+        // Create the shadow tables
+        db.execute(&ShadowOps::create_data_table_sql(&vtab.config), ())?;
+        db.execute(&ShadowOps::create_index_table_sql(&vtab.config), ())?;
+
+        let _ = aux;
+        Ok((schema, vtab))
+    }
+
+    fn destroy(self) -> DisconnectResult<Self> {
+        // Safety: db pointer is valid for 'vtab; we're being destroyed now.
+        let db = unsafe { &*self.db };
+        for sql in ShadowOps::drop_shadow_tables_sql(&self.config.table_name) {
+            if let Err(e) = db.execute(&sql, ()) {
+                return Err((self, e));
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UpdateVTab impl
+// ---------------------------------------------------------------------------
+
+impl<'vtab> UpdateVTab<'vtab> for VectorTable {
+    fn update(&'vtab self, info: &mut ChangeInfo) -> Result<i64> {
+        // Safety: db pointer is valid for 'vtab lifetime.
+        let db = unsafe { &*self.db };
+
+        match info.change_type() {
+            ChangeType::Delete => {
+                let rowid = info.rowid().get_i64();
+                delete_from_data_shadow(db, &self.config.table_name, rowid)?;
+                self.state
+                    .borrow()
+                    .index
+                    .remove(rowid as u64)
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                self.state.borrow_mut().dirty = true;
+                Ok(0)
+            }
+            ChangeType::Insert => {
+                let args = info.args_mut();
+                // args[0] = new rowid (may be NULL → auto-assign)
+                // args[1] = vector blob
+                // args[2..2+N] = metadata cols
+                // args[2+N] = distance (hidden, ignored on insert)
+                let vector_blob = args[1].get_blob()?.to_vec();
+                let num_meta = self.config.metadata_columns.len();
+                let meta_args = &mut args[2..2 + num_meta];
+
+                let rowid =
+                    insert_into_data_shadow(db, &self.config, &vector_blob, meta_args)?;
+
+                let state = self.state.borrow();
+                state
+                    .index
+                    .add(rowid as u64, &vector_blob)
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                drop(state);
+                self.state.borrow_mut().dirty = true;
+
+                Ok(rowid)
+            }
+            ChangeType::Update => {
+                let rowid = info.rowid().get_i64();
+                let args = info.args_mut();
+                // args[0] = new rowid (usually same)
+                // args[1] = vector blob
+                // args[2..2+N] = metadata
+                // args[2+N] = distance (ignored)
+                let vector_blob = args[1].get_blob()?.to_vec();
+                let num_meta = self.config.metadata_columns.len();
+                let meta_args = &mut args[2..2 + num_meta];
+
+                update_data_shadow(db, &self.config, rowid, &vector_blob, meta_args)?;
+
+                // Update index: remove old entry, add new one
+                let state = self.state.borrow();
+                state
+                    .index
+                    .remove(rowid as u64)
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                state
+                    .index
+                    .add(rowid as u64, &vector_blob)
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                drop(state);
+                self.state.borrow_mut().dirty = true;
+
+                Ok(rowid)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TransactionVTab impl
+// ---------------------------------------------------------------------------
+
+impl<'vtab> TransactionVTab<'vtab> for VectorTable {
+    type Transaction = VectorTransaction;
+
+    fn begin(&'vtab self) -> Result<Self::Transaction> {
+        Ok(VectorTransaction {
+            state: Arc::clone(&self.state),
+            table_name: self.config.table_name.clone(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VTabCursor filter wiring — called after open() sets up the cursor
+//
+// The actual data loading happens inside VectorCursor::filter, which receives
+// the index_num set by best_index so it knows what mode to run in.
+// ---------------------------------------------------------------------------
+
+impl VectorCursor {
+    /// Called by filter() after the vtab has populated the cursor's mode.
+    /// This variant is used when the vtab needs to drive the query.
+    pub fn reset_to_scan(&mut self, rows: Vec<ScanRow>) {
+        self.mode = CursorMode::Scan { rows, pos: 0 };
+    }
+
+    pub fn reset_to_knn(&mut self, results: Vec<KnnRow>) {
+        self.mode = CursorMode::Knn { results, pos: 0 };
+    }
+}
