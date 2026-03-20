@@ -6,15 +6,16 @@ pub mod transaction;
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use sqlite3_ext::query::ToParam;
 use sqlite3_ext::vtab::{
     ChangeInfo, ChangeType, ConstraintOp, CreateVTab, DisconnectResult, IndexInfo, TransactionVTab,
     UpdateVTab, VTab, VTabConnection,
 };
-use sqlite3_ext::{Error, FromValue, Result, ValueRef};
+use sqlite3_ext::{Error, FromValue, Result, ValueRef, SQLITE_EMPTY};
 
 use crate::index::HnswIndex;
 use crate::vtab::config::VectorTableConfig;
-use crate::vtab::cursor::{CursorMode, KnnRow, ScanRow, VectorCursor};
+use crate::vtab::cursor::{CursorMode, VectorCursor};
 use crate::vtab::shadow::ShadowOps;
 use crate::vtab::transaction::{IndexState, VectorTransaction};
 
@@ -43,68 +44,70 @@ unsafe impl Sync for VectorTable {}
 // Shadow table I/O stubs — wired up in Task 13
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 /// Load the serialized HNSW index blob from the `_index` shadow table, if present.
 fn load_index_from_shadow(
-    _db: &VTabConnection,
-    _table_name: &str,
+    db: &VTabConnection,
+    table_name: &str,
 ) -> Result<Option<Vec<u8>>> {
-    todo!("Task 13: load index from shadow table")
+    let sql = ShadowOps::select_index_sql(table_name);
+    match db.query_row(&sql, ["hnsw_graph"], |row| {
+        let blob = row[0].get_blob()?;
+        Ok(blob.to_vec())
+    }) {
+        Ok(buf) => Ok(Some(buf)),
+        Err(ref e) if *e == SQLITE_EMPTY => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
-#[allow(dead_code)]
 /// Persist schema/config metadata to the `_index` shadow table.
+#[allow(dead_code)]
 fn save_meta_to_shadow(
-    _db: &VTabConnection,
-    _table_name: &str,
-    _meta_json: &str,
+    db: &VTabConnection,
+    table_name: &str,
+    meta_json: &str,
 ) -> Result<()> {
-    todo!("Task 13: save meta to shadow table")
+    let sql = ShadowOps::upsert_index_sql(table_name);
+    db.execute(&sql, ["meta", meta_json])?;
+    Ok(())
 }
 
 /// Insert a new row into `_data` and return the auto-assigned rowid.
 fn insert_into_data_shadow(
-    _db: &VTabConnection,
-    _config: &VectorTableConfig,
-    _vector_blob: &[u8],
-    _metadata_args: &mut [&mut ValueRef],
+    db: &VTabConnection,
+    config: &VectorTableConfig,
+    vector_blob: &[u8],
+    metadata_args: &mut [&mut ValueRef],
 ) -> Result<i64> {
-    todo!("Task 13: insert into data shadow table")
+    use sqlite3_ext::query::Statement;
+    let sql = ShadowOps::insert_data_sql(config);
+    db.insert(&sql, |stmt: &mut Statement| {
+        vector_blob.bind_param(&mut *stmt, 1)?;
+        for (i, val) in metadata_args.iter_mut().enumerate() {
+            val.bind_param(&mut *stmt, (i + 2) as i32)?;
+        }
+        Ok(())
+    })
 }
 
 /// Delete a row from `_data` by rowid.
-fn delete_from_data_shadow(_db: &VTabConnection, _table_name: &str, _rowid: i64) -> Result<()> {
-    todo!("Task 13: delete from data shadow table")
+fn delete_from_data_shadow(db: &VTabConnection, table_name: &str, rowid: i64) -> Result<()> {
+    let sql = ShadowOps::delete_data_sql(table_name);
+    db.execute(&sql, [rowid])?;
+    Ok(())
 }
 
-/// Update an existing row in `_data`.
+/// Update an existing row in `_data` by deleting and re-inserting.
 fn update_data_shadow(
-    _db: &VTabConnection,
-    _config: &VectorTableConfig,
-    _rowid: i64,
-    _vector_blob: &[u8],
-    _metadata_args: &mut [&mut ValueRef],
+    db: &VTabConnection,
+    config: &VectorTableConfig,
+    rowid: i64,
+    vector_blob: &[u8],
+    metadata_args: &mut [&mut ValueRef],
 ) -> Result<()> {
-    todo!("Task 13: update data shadow table")
-}
-
-#[allow(dead_code)]
-/// Perform a full table scan and return all rows from `_data`.
-fn scan_all_rows(
-    _db: &VTabConnection,
-    _config: &VectorTableConfig,
-) -> Result<Vec<ScanRow>> {
-    todo!("Task 13: scan all rows from data shadow table")
-}
-
-#[allow(dead_code)]
-/// Fetch a single row from `_data` by rowid.
-fn fetch_row_by_id(
-    _db: &VTabConnection,
-    _config: &VectorTableConfig,
-    _id: i64,
-) -> Result<Option<ScanRow>> {
-    todo!("Task 13: fetch row by id from data shadow table")
+    delete_from_data_shadow(db, &config.table_name, rowid)?;
+    insert_into_data_shadow(db, config, vector_blob, metadata_args)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +219,9 @@ impl<'vtab> VTab<'vtab> for VectorTable {
                 pos: 0,
             },
             num_metadata_cols: self.config.metadata_columns.len(),
+            db: self.db,
+            config: &self.config as *const VectorTableConfig,
+            state: Arc::clone(&self.state),
         })
     }
 }
@@ -341,25 +347,8 @@ impl<'vtab> TransactionVTab<'vtab> for VectorTable {
         Ok(VectorTransaction {
             state: Arc::clone(&self.state),
             table_name: self.config.table_name.clone(),
+            db: self.db,
         })
     }
 }
 
-// ---------------------------------------------------------------------------
-// VTabCursor filter wiring — called after open() sets up the cursor
-//
-// The actual data loading happens inside VectorCursor::filter, which receives
-// the index_num set by best_index so it knows what mode to run in.
-// ---------------------------------------------------------------------------
-
-impl VectorCursor {
-    /// Called by filter() after the vtab has populated the cursor's mode.
-    /// This variant is used when the vtab needs to drive the query.
-    pub fn reset_to_scan(&mut self, rows: Vec<ScanRow>) {
-        self.mode = CursorMode::Scan { rows, pos: 0 };
-    }
-
-    pub fn reset_to_knn(&mut self, results: Vec<KnnRow>) {
-        self.mode = CursorMode::Knn { results, pos: 0 };
-    }
-}

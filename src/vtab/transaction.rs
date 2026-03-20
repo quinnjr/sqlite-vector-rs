@@ -1,9 +1,12 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use sqlite3_ext::query::ToParam;
 use sqlite3_ext::{Error, Result};
+use sqlite3_ext::vtab::VTabConnection;
 
 use crate::index::HnswIndex;
+use crate::vtab::shadow::ShadowOps;
 
 pub struct IndexState {
     pub index: HnswIndex,
@@ -14,7 +17,13 @@ pub struct IndexState {
 pub struct VectorTransaction {
     pub state: Arc<RefCell<IndexState>>,
     pub table_name: String,
+    /// Safety: valid for the vtab lifetime — SQLite keeps the connection alive.
+    pub db: *const VTabConnection,
 }
+
+// Safety: VectorTransaction is only ever accessed from a single thread by SQLite.
+unsafe impl Send for VectorTransaction {}
+unsafe impl Sync for VectorTransaction {}
 
 impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
     fn sync(&mut self) -> Result<()> {
@@ -24,6 +33,17 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
                 .index
                 .save_to_buffer()
                 .map_err(|e| Error::Module(e.to_string()))?;
+
+            // Persist serialized HNSW graph to the _index shadow table.
+            use sqlite3_ext::query::Statement;
+            let db = unsafe { &*self.db };
+            let sql = ShadowOps::upsert_index_sql(&self.table_name);
+            db.insert(&sql, |stmt: &mut Statement| {
+                "hnsw_graph".bind_param(&mut *stmt, 1)?;
+                buf.as_slice().bind_param(&mut *stmt, 2)?;
+                Ok(())
+            })?;
+
             s.last_committed = Some(buf);
             s.dirty = false;
         }
@@ -31,7 +51,7 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
     }
 
     fn commit(self) -> Result<()> {
-        // sync() has already serialized; nothing more to do.
+        // sync() has already serialized and persisted; nothing more to do.
         Ok(())
     }
 

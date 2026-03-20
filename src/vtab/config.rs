@@ -16,7 +16,7 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Parsed configuration from CREATE VIRTUAL TABLE arguments.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VectorTableConfig {
     pub db_name: String,
     pub table_name: String,
