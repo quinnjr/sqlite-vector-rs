@@ -283,13 +283,23 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable {
             }
             ChangeType::Insert => {
                 let args = info.args_mut();
-                // args[0] = new rowid (may be NULL → auto-assign)
-                // args[1] = vector blob
-                // args[2..2+N] = metadata cols
-                // args[2+N] = distance (hidden, ignored on insert)
-                let vector_blob = args[1].get_blob()?.to_vec();
+                // SQLite xUpdate argv layout (after argv[0] = old rowid):
+                //   args[0] = new rowid (NULL → auto-assign)
+                //   args[1] = col 0 (id)
+                //   args[2] = col 1 (vector)
+                //   args[3..3+N] = metadata cols
+                //   args[3+N] = distance (hidden, ignored on insert)
+                let vector_blob = args[2].get_blob()?.to_vec();
                 let num_meta = self.config.metadata_columns.len();
-                let meta_args = &mut args[2..2 + num_meta];
+                let meta_args = &mut args[3..3 + num_meta];
+
+                // Validate dimension and finiteness before inserting
+                self.config.vtype
+                    .validate_blob(&vector_blob, self.config.dim)
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                self.config.vtype
+                    .validate_finite(&vector_blob, self.config.dim)
+                    .map_err(|e| Error::Module(e.to_string()))?;
 
                 let rowid =
                     insert_into_data_shadow(db, &self.config, &vector_blob, meta_args)?;
@@ -307,13 +317,10 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable {
             ChangeType::Update => {
                 let rowid = info.rowid().get_i64();
                 let args = info.args_mut();
-                // args[0] = new rowid (usually same)
-                // args[1] = vector blob
-                // args[2..2+N] = metadata
-                // args[2+N] = distance (ignored)
-                let vector_blob = args[1].get_blob()?.to_vec();
+                // args[0] = new rowid, args[1] = id col, args[2] = vector, args[3+N] = distance
+                let vector_blob = args[2].get_blob()?.to_vec();
                 let num_meta = self.config.metadata_columns.len();
-                let meta_args = &mut args[2..2 + num_meta];
+                let meta_args = &mut args[3..3 + num_meta];
 
                 update_data_shadow(db, &self.config, rowid, &vector_blob, meta_args)?;
 

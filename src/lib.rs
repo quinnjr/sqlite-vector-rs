@@ -13,7 +13,11 @@ use sqlite3_ext::*;
 #[cfg(feature = "loadable_extension")]
 #[sqlite3_ext_main(persistent)]
 fn sqlite3_extension_init(db: &Connection) -> Result<()> {
-    db.create_module("vector", sqlite3_ext::vtab::StandardModule::<vtab::VectorTable>::new(), ())?;
+    use sqlite3_ext::vtab::Module;
+    let module = sqlite3_ext::vtab::StandardModule::<vtab::VectorTable>::new()
+        .with_update()
+        .with_transactions();
+    db.create_module("vector", module, ())?;
     scalar::register_scalar_functions(db)?;
     Ok(())
 }
