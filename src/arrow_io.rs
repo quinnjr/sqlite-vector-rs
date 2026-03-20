@@ -58,6 +58,9 @@ pub fn vectors_to_arrow_ipc(
 }
 
 /// Parse an Arrow IPC byte buffer back into raw vector blobs.
+///
+/// If `dim` is 0 the dimension is inferred from the FixedSizeListArray's
+/// `value_length()`, which is encoded in the Arrow schema.
 pub fn arrow_ipc_to_vectors(
     ipc_bytes: &[u8],
     vtype: VectorType,
@@ -74,9 +77,16 @@ pub fn arrow_ipc_to_vectors(
             .downcast_ref::<FixedSizeListArray>()
             .ok_or_else(|| ArrowError("expected FixedSizeListArray".into()))?;
 
+        // Auto-detect dimension from the Arrow schema when caller passes 0.
+        let effective_dim = if dim == 0 {
+            list_col.value_length() as usize
+        } else {
+            dim
+        };
+
         for i in 0..list_col.len() {
             let sub = list_col.value(i);
-            let blob = extract_blob_from_array(&sub, vtype, dim)?;
+            let blob = extract_blob_from_array(&sub, vtype, effective_dim)?;
             all_blobs.push(blob);
         }
     }
