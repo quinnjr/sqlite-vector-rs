@@ -1,0 +1,28 @@
+[package]
+name = "sqlite-vector-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["loadable_extension"]
+loadable_extension = []
+library = ["dep:rusqlite"]
+
+[dependencies]
+sqlite3_ext = { path = "vendor/sqlite3_ext" }
+usearch = "2"
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-ipc = "58"
+arrow-schema = "58"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.39", features = ["bundled", "vtab"], optional = true }
+
+[dev-dependencies]
+rusqlite = { version = "0.39", features = ["bundled", "vtab"] }
+rand = "0.9"

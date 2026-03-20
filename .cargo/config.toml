@@ -1,0 +1,4 @@
+[env]
+# usearch 2.x requires C++14 or later for auto return type deduction.
+# ~/.zshenv sets CXXFLAGS to -std=c++11 -pedantic which breaks the build.
+CXXFLAGS = { value = "-std=c++17 -fPIC -O2 -fstack-protector -mtune=generic", force = true }
