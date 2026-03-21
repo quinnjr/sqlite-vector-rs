@@ -1,3 +1,0 @@
-[submodule "vendor/sqlite3_ext"]
-	path = vendor/sqlite3_ext
-	url = https://github.com/CGamesPlay/sqlite3_ext.git

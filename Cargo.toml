@@ -2,6 +2,11 @@
 name = "sqlite-vector-rs"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "SQLite extension providing PGVector-like native vector types with HNSW indexing"
+repository = "https://github.com/quinnjr/sqlite-vector-rs"
+keywords = ["sqlite", "vector", "hnsw", "embedding", "database"]
+categories = ["database"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -12,7 +17,7 @@ loadable_extension = []
 library = ["dep:rusqlite"]
 
 [dependencies]
-sqlite3_ext = { path = "vendor/sqlite3_ext" }
+sqlite3_ext = { package = "sqlite3-ext-vtab", version = "0.2" }
 usearch = "2"
 arrow-array = "58"
 arrow-buffer = "58"
