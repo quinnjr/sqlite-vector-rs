@@ -1,1 +1,3 @@
 /target
+# Large GGUF model files (downloaded on demand by tests)
+tests/fixtures/*.gguf

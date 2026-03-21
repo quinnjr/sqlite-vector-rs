@@ -10,8 +10,7 @@ use crate::vtab::config::VectorTableConfig;
 use crate::vtab::shadow::ShadowOps;
 use crate::vtab::transaction::IndexState;
 
-// Index numbers must match those in mod.rs
-const INDEX_SCAN: i32 = 0;
+// Index number must match INDEX_KNN in mod.rs
 const INDEX_KNN: i32 = 1;
 
 pub enum CursorMode {
@@ -144,7 +143,7 @@ impl VTabCursor for VectorCursor {
                 }
                 self.mode = CursorMode::Knn { results, pos: 0 };
             }
-            INDEX_SCAN | _ => {
+            _ => {
                 let rows = scan_all_rows(db, config)?;
                 self.mode = CursorMode::Scan { rows, pos: 0 };
             }

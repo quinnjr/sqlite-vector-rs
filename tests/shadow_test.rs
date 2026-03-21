@@ -13,7 +13,15 @@ fn create_data_table_sql_basic() {
 
 #[test]
 fn create_data_table_sql_with_metadata() {
-    let args = vec!["vector", "main", "emb", "dim=3", "type=float4", "metric=l2", "metadata=\"label TEXT, score REAL\""];
+    let args = vec![
+        "vector",
+        "main",
+        "emb",
+        "dim=3",
+        "type=float4",
+        "metric=l2",
+        "metadata=\"label TEXT, score REAL\"",
+    ];
     let config = VectorTableConfig::parse(&args).unwrap();
     let sql = ShadowOps::create_data_table_sql(&config);
     assert!(sql.contains("label TEXT"));
@@ -32,7 +40,15 @@ fn create_index_table_sql() {
 
 #[test]
 fn insert_data_sql_with_metadata() {
-    let args = vec!["vector", "main", "emb", "dim=3", "type=float4", "metric=l2", "metadata=\"label TEXT\""];
+    let args = vec![
+        "vector",
+        "main",
+        "emb",
+        "dim=3",
+        "type=float4",
+        "metric=l2",
+        "metadata=\"label TEXT\"",
+    ];
     let config = VectorTableConfig::parse(&args).unwrap();
     let sql = ShadowOps::insert_data_sql(&config);
     assert!(sql.contains("\"emb_data\""));

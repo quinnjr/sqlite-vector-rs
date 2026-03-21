@@ -1,7 +1,6 @@
 mod common;
 
 use common::open_with_extension;
-use rusqlite::params;
 use sqlite_vector_rs::types::VectorType;
 
 #[test]

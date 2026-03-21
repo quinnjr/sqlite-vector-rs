@@ -31,3 +31,5 @@ required-features = ["library"]
 rusqlite = { version = "0.39", features = ["bundled", "vtab", "load_extension"] }
 rand = "0.9"
 tempfile = "3"
+pdf-extract = "0.7"
+llama-gguf = { version = "0.13", default-features = false }

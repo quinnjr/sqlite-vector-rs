@@ -1,4 +1,4 @@
-use sqlite_vector_rs::types::{VectorType, VectorTypeError};
+use sqlite_vector_rs::types::VectorType;
 
 #[test]
 fn parse_type_names() {

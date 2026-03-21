@@ -209,3 +209,202 @@ fn extract_blob_from_array(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::VectorType;
+    use half::f16;
+
+    // ----------------------------------------------------------------
+    // helpers
+    // ----------------------------------------------------------------
+
+    /// Build a Float4 blob from a slice of f32 values.
+    fn f32_blob(values: &[f32]) -> Vec<u8> {
+        VectorType::Float4.slice_to_blob(values)
+    }
+
+    /// Build a Float8 blob from a slice of f64 values.
+    fn f64_blob(values: &[f64]) -> Vec<u8> {
+        VectorType::Float8.slice_to_blob(values)
+    }
+
+    /// Build an Int1 blob from a slice of i8 values.
+    fn i8_blob(values: &[i8]) -> Vec<u8> {
+        VectorType::Int1.slice_to_blob(values)
+    }
+
+    /// Build an Int2 blob from a slice of i16 values.
+    fn i16_blob(values: &[i16]) -> Vec<u8> {
+        VectorType::Int2.slice_to_blob(values)
+    }
+
+    /// Build an Int4 blob from a slice of i32 values.
+    fn i32_blob(values: &[i32]) -> Vec<u8> {
+        VectorType::Int4.slice_to_blob(values)
+    }
+
+    /// Build a Float2 blob from a slice of f16 values.
+    fn f16_blob(values: &[f16]) -> Vec<u8> {
+        VectorType::Float2.slice_to_blob(values)
+    }
+
+    // ----------------------------------------------------------------
+    // 1. Round-trip Float4
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn round_trip_float4() {
+        let blobs = vec![f32_blob(&[1.0_f32, 2.0, 3.0])];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Float4, 3).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Float4, 3).unwrap();
+        assert_eq!(result, blobs);
+    }
+
+    // ----------------------------------------------------------------
+    // 2. Round-trip Float8
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn round_trip_float8() {
+        let blobs = vec![f64_blob(&[1.0_f64, -2.5, 3.125])];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Float8, 3).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Float8, 3).unwrap();
+        assert_eq!(result, blobs);
+    }
+
+    // ----------------------------------------------------------------
+    // 3. Round-trip Int1, Int2, Int4
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn round_trip_int1() {
+        let blobs = vec![i8_blob(&[i8::MIN, 0, i8::MAX])];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Int1, 3).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Int1, 3).unwrap();
+        assert_eq!(result, blobs);
+    }
+
+    #[test]
+    fn round_trip_int2() {
+        let blobs = vec![i16_blob(&[i16::MIN, 0, i16::MAX])];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Int2, 3).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Int2, 3).unwrap();
+        assert_eq!(result, blobs);
+    }
+
+    #[test]
+    fn round_trip_int4() {
+        let blobs = vec![i32_blob(&[i32::MIN, 0, i32::MAX])];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Int4, 3).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Int4, 3).unwrap();
+        assert_eq!(result, blobs);
+    }
+
+    // ----------------------------------------------------------------
+    // 4. Round-trip Float2 (half precision)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn round_trip_float2() {
+        let values = vec![f16::from_f32(1.0), f16::from_f32(-0.5), f16::from_f32(0.25)];
+        let blobs = vec![f16_blob(&values)];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Float2, 3).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Float2, 3).unwrap();
+        assert_eq!(result, blobs);
+    }
+
+    // ----------------------------------------------------------------
+    // 5. Empty blobs list → empty IPC → empty result
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn empty_blobs_round_trip() {
+        // vectors_to_arrow_ipc with an empty slice should produce valid IPC
+        // that decodes back to an empty vector list.
+        //
+        // Note: dim must be non-zero for Arrow schema encoding even when
+        // there are no rows; we use dim=4 as a representative dimension.
+        let blobs: Vec<Vec<u8>> = vec![];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Float4, 4).unwrap();
+        assert!(
+            !ipc.is_empty(),
+            "IPC buffer must contain at least the schema header"
+        );
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Float4, 4).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // 6. Dim auto-detection: encode with dim=3, decode with dim=0
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn dim_auto_detection_float4() {
+        let blobs = vec![f32_blob(&[10.0_f32, 20.0, 30.0])];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Float4, 3).unwrap();
+        // Pass dim=0 to trigger auto-detection from the Arrow schema.
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Float4, 0).unwrap();
+        assert_eq!(result, blobs);
+    }
+
+    #[test]
+    fn dim_auto_detection_int2() {
+        let blobs = vec![i16_blob(&[1_i16, 2, 3])];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Int2, 3).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Int2, 0).unwrap();
+        assert_eq!(result, blobs);
+    }
+
+    // ----------------------------------------------------------------
+    // 7. Multiple vectors round-trip (5 vectors)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn multiple_vectors_float4() {
+        let blobs: Vec<Vec<u8>> = (0..5_u32)
+            .map(|i| {
+                let base = i as f32;
+                f32_blob(&[base, base + 1.0, base + 2.0, base + 3.0])
+            })
+            .collect();
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Float4, 4).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Float4, 4).unwrap();
+        assert_eq!(result.len(), 5);
+        assert_eq!(result, blobs);
+    }
+
+    #[test]
+    fn multiple_vectors_int4() {
+        let blobs: Vec<Vec<u8>> = (0..5_i32)
+            .map(|i| i32_blob(&[i * 10, i * 10 + 1, i * 10 + 2]))
+            .collect();
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Int4, 3).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Int4, 3).unwrap();
+        assert_eq!(result.len(), 5);
+        assert_eq!(result, blobs);
+    }
+
+    // ----------------------------------------------------------------
+    // 8. Single vector round-trip
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn single_vector_float8() {
+        let blobs = vec![f64_blob(&[std::f64::consts::PI, std::f64::consts::E])];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Float8, 2).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Float8, 2).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result, blobs);
+    }
+
+    #[test]
+    fn single_vector_int1() {
+        let blobs = vec![i8_blob(&[-1_i8, 0, 127])];
+        let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Int1, 3).unwrap();
+        let result = arrow_ipc_to_vectors(&ipc, VectorType::Int1, 3).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result, blobs);
+    }
+}

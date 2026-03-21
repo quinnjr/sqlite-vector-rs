@@ -14,6 +14,7 @@ pub fn open_with_extension() -> Connection {
 }
 
 /// Create a file-backed SQLite connection (for persistence tests).
+#[allow(dead_code)]
 pub fn open_file_with_extension(path: &Path) -> Connection {
     let conn = Connection::open(path).unwrap();
     unsafe {
@@ -26,16 +27,17 @@ pub fn open_file_with_extension(path: &Path) -> Connection {
 }
 
 fn find_extension_path() -> &'static str {
-    if cfg!(target_os = "linux") {
+    if cfg!(target_os = "macos") {
         "target/debug/libsqlite_vector_rs"
-    } else if cfg!(target_os = "macos") {
-        "target/debug/libsqlite_vector_rs"
-    } else {
+    } else if cfg!(target_os = "windows") {
         "target/debug/sqlite_vector_rs"
+    } else {
+        "target/debug/libsqlite_vector_rs"
     }
 }
 
 /// Generate a random f32 vector of given dimension.
+#[allow(dead_code)]
 pub fn random_f32_vector(dim: usize) -> Vec<f32> {
     use rand::Rng;
     let mut rng = rand::rng();

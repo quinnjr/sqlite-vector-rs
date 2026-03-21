@@ -108,6 +108,7 @@ fn update_data_shadow(
 // Shared init logic used by both connect and create
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::arc_with_non_send_sync)]
 fn init<'vtab>(db: &VTabConnection, args: &[&str]) -> Result<(String, VectorTable<'vtab>)> {
     let config = VectorTableConfig::parse(args).map_err(|e| Error::Module(e.to_string()))?;
 
@@ -191,22 +192,22 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
             if !c.usable() {
                 continue;
             }
-            if c.column() == distance_col {
-                if let ConstraintOp::Function(_) = c.op() {
-                    // knn_match(distance_col, query_blob): query_blob passed to filter
-                    c.set_argv_index(Some(argv_next - 1));
-                    c.set_omit(true);
-                    argv_next += 1;
-                    found_knn = true;
-                }
+            if c.column() == distance_col
+                && let ConstraintOp::Function(_) = c.op()
+            {
+                // knn_match(distance_col, query_blob): query_blob passed to filter
+                c.set_argv_index(Some(argv_next - 1));
+                c.set_omit(true);
+                argv_next += 1;
+                found_knn = true;
             }
             // Capture LIMIT as the k parameter for KNN searches
-            if let ConstraintOp::Limit = c.op() {
-                if found_knn {
-                    c.set_argv_index(Some(argv_next - 1));
-                    c.set_omit(true);
-                    argv_next += 1;
-                }
+            if let ConstraintOp::Limit = c.op()
+                && found_knn
+            {
+                c.set_argv_index(Some(argv_next - 1));
+                c.set_omit(true);
+                argv_next += 1;
             }
         }
 
