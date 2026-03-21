@@ -1,10 +1,17 @@
-use sqlite_vector_rs::vtab::config::VectorTableConfig;
-use sqlite_vector_rs::types::VectorType;
 use sqlite_vector_rs::distance::DistanceMetric;
+use sqlite_vector_rs::types::VectorType;
+use sqlite_vector_rs::vtab::config::VectorTableConfig;
 
 #[test]
 fn parse_basic_args() {
-    let args = vec!["vector", "main", "embeddings", "dim=3", "type=float4", "metric=l2"];
+    let args = vec![
+        "vector",
+        "main",
+        "embeddings",
+        "dim=3",
+        "type=float4",
+        "metric=l2",
+    ];
     let config = VectorTableConfig::parse(&args).unwrap();
     assert_eq!(config.dim, 3);
     assert_eq!(config.vtype, VectorType::Float4);
@@ -15,7 +22,17 @@ fn parse_basic_args() {
 
 #[test]
 fn parse_with_hnsw_params() {
-    let args = vec!["vector", "main", "emb", "dim=768", "type=float4", "metric=cosine", "m=32", "ef_construction=400", "ef_search=128"];
+    let args = vec![
+        "vector",
+        "main",
+        "emb",
+        "dim=768",
+        "type=float4",
+        "metric=cosine",
+        "m=32",
+        "ef_construction=400",
+        "ef_search=128",
+    ];
     let config = VectorTableConfig::parse(&args).unwrap();
     assert_eq!(config.hnsw_params.m, 32);
     assert_eq!(config.hnsw_params.ef_construction, 400);
@@ -24,11 +41,25 @@ fn parse_with_hnsw_params() {
 
 #[test]
 fn parse_with_metadata() {
-    let args = vec!["vector", "main", "emb", "dim=3", "type=float4", "metric=l2", "metadata=\"label TEXT, category INTEGER\""];
+    let args = vec![
+        "vector",
+        "main",
+        "emb",
+        "dim=3",
+        "type=float4",
+        "metric=l2",
+        "metadata=\"label TEXT, category INTEGER\"",
+    ];
     let config = VectorTableConfig::parse(&args).unwrap();
     assert_eq!(config.metadata_columns.len(), 2);
-    assert_eq!(config.metadata_columns[0], ("label".to_string(), "TEXT".to_string()));
-    assert_eq!(config.metadata_columns[1], ("category".to_string(), "INTEGER".to_string()));
+    assert_eq!(
+        config.metadata_columns[0],
+        ("label".to_string(), "TEXT".to_string())
+    );
+    assert_eq!(
+        config.metadata_columns[1],
+        ("category".to_string(), "INTEGER".to_string())
+    );
 }
 
 #[test]
@@ -67,7 +98,15 @@ fn generates_create_table_sql() {
 
 #[test]
 fn generates_schema_with_metadata() {
-    let args = vec!["vector", "main", "emb", "dim=3", "type=float4", "metric=l2", "metadata=\"label TEXT, category INTEGER\""];
+    let args = vec![
+        "vector",
+        "main",
+        "emb",
+        "dim=3",
+        "type=float4",
+        "metric=l2",
+        "metadata=\"label TEXT, category INTEGER\"",
+    ];
     let config = VectorTableConfig::parse(&args).unwrap();
     let sql = config.vtab_schema();
     assert!(sql.contains("label TEXT"));

@@ -1,4 +1,4 @@
-use sqlite_vector_rs::json::{json_to_blob, blob_to_json};
+use sqlite_vector_rs::json::{blob_to_json, json_to_blob};
 use sqlite_vector_rs::types::VectorType;
 
 #[test]
