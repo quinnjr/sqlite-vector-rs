@@ -211,7 +211,7 @@ SELECT vector_rebuild_index('dest_table', 'float4', 'cosine');
 
 | Crate | Purpose |
 |-------|---------|
-| [sqlite3-ext-vtab](https://crates.io/crates/sqlite3-ext-vtab) | SQLite extension + virtual table API |
+| [sqlite3_ext](https://crates.io/crates/sqlite3_ext) | SQLite extension + virtual table API |
 | [usearch](https://crates.io/crates/usearch) | HNSW approximate nearest-neighbor index |
 | [arrow-*](https://crates.io/crates/arrow) (v58) | Arrow IPC stream encoding for bulk I/O |
 | [half](https://crates.io/crates/half) | IEEE 754 half-precision (f16) support |

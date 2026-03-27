@@ -20,7 +20,7 @@ crate-type = ["cdylib", "rlib"]
 
 | Crate | Purpose |
 |-------|---------|
-| `sqlite3_ext` (vendored fork) | Loadable extension framework, virtual table API |
+| `sqlite3_ext` | Loadable extension framework, virtual table API |
 | `rusqlite` (dev + optional feature) | Library-mode API, testing |
 | `usearch` | HNSW indexing with persistence |
 | `arrow-array`, `arrow-buffer`, `arrow-ipc`, `arrow-schema` | Vector type system, storage format, bulk I/O |

@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-vector-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "SQLite extension providing PGVector-like native vector types with HNSW indexing"
@@ -17,7 +17,7 @@ loadable_extension = []
 library = ["dep:rusqlite", "loadable_extension"]
 
 [dependencies]
-sqlite3_ext = { package = "sqlite3-ext-vtab", version = "0.2" }
+sqlite3_ext = "0.2"
 usearch = "2"
 arrow-array = "58"
 arrow-buffer = "58"
