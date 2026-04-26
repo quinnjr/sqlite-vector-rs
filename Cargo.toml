@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-vector-rs"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "SQLite extension providing PGVector-like native vector types with HNSW indexing"
@@ -26,14 +26,14 @@ arrow-schema = "58"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = ">=0.37, <0.40", features = ["bundled", "vtab", "load_extension"], optional = true }
+rusqlite = { version = ">=0.32, <0.40", features = ["bundled", "vtab", "load_extension"], optional = true }
 
 [[bin]]
 name = "sqlite3"
 required-features = ["library"]
 
 [dev-dependencies]
-rusqlite = { version = ">=0.37, <0.40", features = ["bundled", "vtab", "load_extension"] }
+rusqlite = { version = ">=0.32, <0.40", features = ["bundled", "vtab", "load_extension"] }
 rand = "0.9"
 tempfile = "3"
 pdf-extract = "0.7"
