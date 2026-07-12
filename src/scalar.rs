@@ -317,5 +317,105 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
         )?;
     }
 
+    // vector_ef_search(table_name, n) -> INTEGER (the new value)
+    {
+        let registry = registry.clone();
+        db.create_scalar_function(
+            "vector_ef_search",
+            &FunctionOptions::default().set_n_args(2),
+            move |ctx, args| {
+                let table_name = args[0].get_str()?.to_owned();
+                let n = args[1].get_i64();
+                if n <= 0 {
+                    return Err(Error::Module("ef_search must be positive".into()));
+                }
+                let (state, config) = registry
+                    .get(&table_name)
+                    .map_err(Error::Module)?;
+
+                if config.db_name != "main" {
+                    return Err(Error::Module(format!(
+                        "vector_ef_search is not supported for tables in attached database '{}' yet; only 'main' is supported",
+                        config.db_name
+                    )));
+                }
+
+                let s = state.borrow();
+                let idx = s.index.as_ref().ok_or_else(|| {
+                    Error::Module(format!("table '{}' uses mode=exact and has no index", table_name))
+                })?;
+                idx.set_ef_search(n as usize);
+                drop(s);
+
+                // Patch the persisted meta so reconnects keep the new value.
+                let db = ctx.db();
+                let meta_json = db.query_row(
+                    &ShadowOps::select_index_sql(&table_name),
+                    ["meta"],
+                    |row| Ok(row[0].get_str()?.to_owned()),
+                )?;
+                let mut meta: serde_json::Value =
+                    serde_json::from_str(&meta_json).map_err(|e| Error::Module(e.to_string()))?;
+                meta["ef_search"] = serde_json::json!(n);
+                db.insert(&ShadowOps::upsert_index_sql(&table_name), |stmt: &mut query::Statement| {
+                    "meta".bind_param(&mut *stmt, 1)?;
+                    meta.to_string().as_str().bind_param(&mut *stmt, 2)?;
+                    Ok(())
+                })?;
+                ctx.set_result(n)?;
+                Ok(())
+            },
+        )?;
+    }
+
+    // vector_index_info(table_name) -> TEXT (JSON)
+    {
+        let registry = registry.clone();
+        db.create_scalar_function(
+            "vector_index_info",
+            &FunctionOptions::default().set_n_args(1),
+            move |ctx, args| {
+                let table_name = args[0].get_str()?.to_owned();
+                let (state, config) = registry
+                    .get(&table_name)
+                    .map_err(Error::Module)?;
+
+                if config.db_name != "main" {
+                    return Err(Error::Module(format!(
+                        "vector_index_info is not supported for tables in attached database '{}' yet; only 'main' is supported",
+                        config.db_name
+                    )));
+                }
+
+                let s = state.borrow();
+                let (rows, ef_live) = match &s.index {
+                    Some(idx) => (idx.len() as i64, idx.ef_search() as i64),
+                    None => {
+                        let n: i64 = ctx.db().query_row(
+                            &format!("SELECT count(*) FROM \"{table_name}_data\""),
+                            (),
+                            |row| Ok(row[0].get_i64()),
+                        )?;
+                        (n, 0)
+                    }
+                };
+                let info = serde_json::json!({
+                    "rows": rows,
+                    "dim": config.dim,
+                    "type": config.vtype.name(),
+                    "metric": config.metric.name(),
+                    "mode": config.mode.name(),
+                    "m": config.hnsw_params.m,
+                    "ef_construction": config.hnsw_params.ef_construction,
+                    "ef_search": if ef_live > 0 { ef_live } else { config.hnsw_params.ef_search as i64 },
+                    "sync_every": config.sync_every,
+                    "changes_since_persist": s.changes_since_persist,
+                });
+                ctx.set_result(info.to_string())?;
+                Ok(())
+            },
+        )?;
+    }
+
     Ok(())
 }

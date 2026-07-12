@@ -195,6 +195,16 @@ impl HnswIndex {
             .map_err(|e| IndexError(e.to_string()))
     }
 
+    /// Set the expansion factor for search.
+    pub fn set_ef_search(&self, n: usize) {
+        self.inner.change_expansion_search(n);
+    }
+
+    /// Get the current expansion factor for search.
+    pub fn ef_search(&self) -> usize {
+        self.inner.expansion_search()
+    }
+
     /// Reserve capacity if needed (doubles current capacity).
     fn reserve_if_needed(&self) -> Result<(), IndexError> {
         if self.inner.size() >= self.inner.capacity() {

@@ -262,3 +262,30 @@ fn exact_mode_respects_filters_and_limit() {
         .unwrap();
     assert_eq!(ids, vec![2, 3]);
 }
+
+#[test]
+fn index_info_reports_state_and_ef_search_is_adjustable() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ii USING vector(dim=4, type=float4, metric=cosine, m=8, ef_search=32);
+         INSERT INTO ii(vector) VALUES (vector_from_json('[1.0, 0.0, 0.0, 0.0]', 'float4'));",
+    )
+    .unwrap();
+    let info: String = conn
+        .query_row("SELECT vector_index_info('ii')", [], |r| r.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(v["rows"], 1);
+    assert_eq!(v["dim"], 4);
+    assert_eq!(v["metric"], "cosine");
+    assert_eq!(v["mode"], "hnsw");
+    assert_eq!(v["ef_search"], 32);
+
+    conn.query_row("SELECT vector_ef_search('ii', 128)", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    let info2: String = conn
+        .query_row("SELECT vector_index_info('ii')", [], |r| r.get(0))
+        .unwrap();
+    let v2: serde_json::Value = serde_json::from_str(&info2).unwrap();
+    assert_eq!(v2["ef_search"], 128);
+}
