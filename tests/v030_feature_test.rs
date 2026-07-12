@@ -145,3 +145,38 @@ fn autocommit_inserts_within_3x_of_single_transaction() {
         "autocommit {auto:?} must stay within 3x of one-txn {txn:?} (+200ms slack)"
     );
 }
+
+#[test]
+fn filtered_knn_returns_full_limit_beyond_default_k() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE fk USING vector(dim=2, type=float4, metric=l2, metadata=\"label TEXT\");",
+    )
+    .unwrap();
+    // 150 near rows labeled 'b' (crowd out DEFAULT_KNN_K=100), then 5 far rows labeled 'a'.
+    for i in 0..150 {
+        conn.execute(
+            "INSERT INTO fk(vector, label) VALUES (vector_from_json(?1, 'float4'), 'b')",
+            [format!("[{}, 0.0]", i as f64 * 0.01)],
+        )
+        .unwrap();
+    }
+    for i in 0..5 {
+        conn.execute(
+            "INSERT INTO fk(vector, label) VALUES (vector_from_json(?1, 'float4'), 'a')",
+            [format!("[{}.0, 50.0]", i)],
+        )
+        .unwrap();
+    }
+    let ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM fk WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4'))
+             AND label = 'a' LIMIT 3",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids.len(), 3, "oversampling must reach past the crowd of 'b' rows");
+}

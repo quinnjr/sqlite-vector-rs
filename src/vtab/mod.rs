@@ -417,12 +417,15 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
 
     fn best_index(&'vtab self, info: &mut IndexInfo) -> Result<()> {
         // Distance column index = 2 + num_metadata_cols
-        let distance_col = (2 + self.config.metadata_columns.len()) as i32;
+        let n_meta = self.config.metadata_columns.len() as i32;
+        let distance_col = 2 + n_meta;
 
-        // Pass 1: classify.
+        // Pass 1: classify. Metadata-column constraints with a supported op
+        // become pushable filters instead of forcing has_other.
         let mut has_knn = false;
         let mut has_limit = false;
         let mut has_other = false;
+        let mut filters: Vec<(i32, &'static str)> = Vec::new();
         for c in info.constraints() {
             if !c.usable() {
                 continue;
@@ -431,7 +434,22 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
                 has_knn = true;
             } else if matches!(c.op(), ConstraintOp::Limit) {
                 has_limit = true;
-            } else if !matches!(c.op(), ConstraintOp::Offset) {
+            } else if matches!(c.op(), ConstraintOp::Offset) {
+                // Offset is neither pushed nor blocking on its own.
+            } else if c.column() >= 2 && c.column() < 2 + n_meta {
+                let op = match c.op() {
+                    ConstraintOp::Eq => Some("eq"),
+                    ConstraintOp::GT => Some("gt"),
+                    ConstraintOp::GE => Some("ge"),
+                    ConstraintOp::LT => Some("lt"),
+                    ConstraintOp::LE => Some("le"),
+                    _ => None,
+                };
+                match op {
+                    Some(op) => filters.push((c.column(), op)),
+                    None => has_other = true,
+                }
+            } else {
                 has_other = true;
             }
         }
@@ -448,19 +466,50 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
 
         let take_limit = has_knn && has_limit && order_consumable && !has_other;
 
-        // Pass 2: assign argv slots. argv 0 = query blob; argv 1 = k (only when taken).
+        // Pass 2: assign argv slots. The wire contract (index_str + argv) is
+        // fixed as query, then k (if taken), then filter values in `filters`
+        // order — independent of whatever order SQLite hands back constraints
+        // from `info.constraints()`. So assign in three separate passes rather
+        // than relying on iteration order: knn function constraint first,
+        // then limit, then each pushed filter in `filters` order. Filters are
+        // left un-omitted so SQLite double-checks them.
         let mut argv_next: u32 = 1;
         for mut c in info.constraints() {
-            if !c.usable() {
-                continue;
-            }
-            if c.column() == distance_col && matches!(c.op(), ConstraintOp::Function(_)) {
+            if c.usable()
+                && c.column() == distance_col
+                && matches!(c.op(), ConstraintOp::Function(_))
+            {
                 c.set_argv_index(Some(argv_next - 1));
                 c.set_omit(true);
                 argv_next += 1;
-            } else if matches!(c.op(), ConstraintOp::Limit) && take_limit {
-                c.set_argv_index(Some(argv_next - 1));
-                argv_next += 1;
+            }
+        }
+        if take_limit {
+            for mut c in info.constraints() {
+                if c.usable() && matches!(c.op(), ConstraintOp::Limit) {
+                    c.set_argv_index(Some(argv_next - 1));
+                    argv_next += 1;
+                }
+            }
+        }
+        for (filter_col, filter_op) in &filters {
+            for mut c in info.constraints() {
+                if !c.usable() || c.column() != *filter_col {
+                    continue;
+                }
+                let op = match c.op() {
+                    ConstraintOp::Eq => "eq",
+                    ConstraintOp::GT => "gt",
+                    ConstraintOp::GE => "ge",
+                    ConstraintOp::LT => "lt",
+                    ConstraintOp::LE => "le",
+                    _ => continue,
+                };
+                if op == *filter_op {
+                    c.set_argv_index(Some(argv_next - 1));
+                    argv_next += 1;
+                    break;
+                }
             }
         }
 
@@ -471,6 +520,16 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
             }
             info.set_estimated_cost(10.0);
             info.set_estimated_rows(10);
+            let spec = format!(
+                "knn;limit={};f={}",
+                if take_limit { 1 } else { 0 },
+                filters
+                    .iter()
+                    .map(|(c, o)| format!("{c}:{o}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            info.set_index_str(Some(&spec))?;
         } else {
             info.set_index_num(INDEX_SCAN);
             info.set_estimated_cost(1_000_000.0);

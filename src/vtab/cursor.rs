@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use sqlite3_ext::{
     Error, FallibleIteratorMut, FromValue, Result, Value, ValueRef,
-    query::QueryResult,
+    query::{QueryResult, ToParam},
     vtab::{ColumnContext, VTabConnection, VTabCursor},
 };
 
@@ -91,7 +91,7 @@ impl VTabCursor for VectorCursor {
     fn filter(
         &mut self,
         index_num: i32,
-        _index_str: Option<&str>,
+        index_str: Option<&str>,
         args: &mut [&mut ValueRef],
     ) -> Result<()> {
         // Safety: db, config, and sql pointers are valid for the vtab lifetime.
@@ -102,40 +102,96 @@ impl VTabCursor for VectorCursor {
         match index_num {
             INDEX_KNN => {
                 // args[0] = query vector blob (from knn_match function constraint)
-                // args[1] = k (from LIMIT clause, if present)
+                // args[1] = k (from LIMIT clause, if present, per index_str's limit=1)
+                // args[1 or 2..] = pushed metadata filter values, in index_str's f= order
                 if args.is_empty() {
                     return Err(Error::Module(
                         "knn_match requires a query vector argument".into(),
                     ));
                 }
                 let query_blob = args[0].get_blob()?.to_vec();
-                let k = if args.len() > 1 {
-                    args[1].get_i64() as usize
+
+                let spec = index_str.unwrap_or("knn;limit=0;f=");
+                let limit_taken = spec.contains("limit=1");
+                let filter_part = spec.rsplit("f=").next().unwrap_or("");
+                let filters: Vec<(usize, &str)> = filter_part
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        let (col, op) = s.split_once(':').expect("index_str built by best_index");
+                        (col.parse::<usize>().unwrap(), op)
+                    })
+                    .collect();
+
+                let mut next_arg = 1;
+                let k = if limit_taken {
+                    let k = args[next_arg].get_i64() as usize;
+                    next_arg += 1;
+                    k
                 } else {
                     // Default k when no LIMIT is specified
                     crate::vtab::DEFAULT_KNN_K
                 };
-
-                let state = self.state.borrow();
-                let hits = state
-                    .index
-                    .search(&query_blob, k)
-                    .map_err(|e| Error::Module(e.to_string()))?;
+                let filter_args = &mut args[next_arg..];
 
                 let num_meta = config.metadata_columns.len();
-                let mut stmt = db.prepare(&sql.fetch_by_id)?;
-                let mut results = Vec::with_capacity(hits.len());
-                for (key, dist) in hits {
-                    stmt.query([key as i64])?;
-                    if let Some(row) = stmt.next()? {
-                        let r = read_scan_row(row, num_meta)?;
-                        results.push(KnnRow {
-                            id: r.id,
-                            vector: r.vector,
-                            metadata: r.metadata,
-                            distance: dist as f64,
-                        });
+                let mut fetch_sql = sql.fetch_by_id.clone();
+                for (col, op) in &filters {
+                    let name = &config.metadata_columns[col - 2].0;
+                    let sql_op = match *op {
+                        "eq" => "=",
+                        "gt" => ">",
+                        "ge" => ">=",
+                        "lt" => "<",
+                        "le" => "<=",
+                        _ => unreachable!("index_str built by best_index"),
+                    };
+                    fetch_sql.push_str(&format!(" AND {name} {sql_op} ?"));
+                }
+
+                let target_k = k;
+                let index_len = {
+                    let state = self.state.borrow();
+                    state.index.len()
+                };
+                let mut kp = (4 * target_k).max(target_k + 16).min(index_len.max(1));
+                let mut results: Vec<KnnRow>;
+                let mut stmt = db.prepare(&fetch_sql)?;
+                loop {
+                    let hits = {
+                        let state = self.state.borrow();
+                        state
+                            .index
+                            .search(&query_blob, kp)
+                            .map_err(|e| Error::Module(e.to_string()))?
+                    };
+                    results = Vec::with_capacity(target_k);
+                    for (key, dist) in &hits {
+                        stmt.query(|q: &mut sqlite3_ext::query::Statement| {
+                            (*key as i64).bind_param(q, 1)?;
+                            for (i, arg) in filter_args.iter_mut().enumerate() {
+                                let vref: &ValueRef = arg;
+                                vref.bind_param(q, (i + 2) as i32)?;
+                            }
+                            Ok(())
+                        })?;
+                        if let Some(row) = stmt.next()? {
+                            let r = read_scan_row(row, num_meta)?;
+                            results.push(KnnRow {
+                                id: r.id,
+                                vector: r.vector,
+                                metadata: r.metadata,
+                                distance: *dist as f64,
+                            });
+                            if results.len() >= target_k {
+                                break;
+                            }
+                        }
                     }
+                    if results.len() >= target_k || kp >= index_len {
+                        break;
+                    }
+                    kp = (kp * 2).min(index_len);
                 }
                 self.mode = CursorMode::Knn { results, pos: 0 };
             }
