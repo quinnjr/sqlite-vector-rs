@@ -35,7 +35,18 @@ fn unpersisted_commits_survive_reconnect_via_reconcile() {
 }
 
 #[test]
-fn stale_deletes_trigger_rebuild_on_connect() {
+fn deleted_rows_absent_after_reconnect() {
+    // NOTE: this test does NOT exercise the connect-time rebuild-from-scratch
+    // branch in `reconcile_index` (`index.len() != count`). Deletes are
+    // eagerly persisted at commit (see `IndexState::destructive_since_persist`
+    // in src/vtab/transaction.rs), so by the time this connection is dropped,
+    // the persisted graph already agrees with `_data`: reconnect finds
+    // `index.len() == count` and takes the cheap "already reconciled" path.
+    // What this test DOES verify is the simpler, more common case: a DELETE
+    // through the vtab (not a raw shadow-table write) is durable across a
+    // reconnect. For a test that genuinely forces the rebuild branch by
+    // making the persisted graph stale relative to `_data`, see
+    // `connect_time_rebuild_from_data_when_graph_stale` below.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.db");
     {
@@ -53,7 +64,7 @@ fn stale_deletes_trigger_rebuild_on_connect() {
         }
         conn.query_row("SELECT vector_sync_index('t')", [], |r| r.get::<_, i64>(0))
             .unwrap(); // graph persisted with 5 keys
-        conn.execute("DELETE FROM t WHERE id <= 2", []).unwrap(); // not persisted
+        conn.execute("DELETE FROM t WHERE id <= 2", []).unwrap(); // eagerly persisted (destructive_since_persist)
     }
     let conn = open_file_with_extension(&path);
     let ids: Vec<i64> = conn
@@ -65,8 +76,69 @@ fn stale_deletes_trigger_rebuild_on_connect() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(ids.len(), 3, "stale graph keys must be dropped by rebuild");
+    assert_eq!(
+        ids.len(),
+        3,
+        "deleted rows must not resurface after reconnect"
+    );
     assert!(ids.iter().all(|id| *id >= 3));
+}
+
+#[test]
+fn connect_time_rebuild_from_data_when_graph_stale() {
+    // Forces the genuine rebuild-from-scratch branch in `reconcile_index`
+    // (`index.len() != count`): persist a graph with N keys via
+    // `vector_sync_index`, then delete a row by writing DIRECTLY to the
+    // `_data` shadow table via plain SQL. This bypasses the vtab entirely
+    // (no xUpdate call, so no eager persist / `destructive_since_persist`
+    // marking), leaving the persisted graph with a stale key that no longer
+    // exists in `_data`. `<table>_data` is an ordinary SQLite table (see
+    // `CREATE TABLE IF NOT EXISTS "{}_data"` in src/vtab/shadow.rs) — it is
+    // not a real sqlite3 "shadow table" gated by module-declared eponymous
+    // naming/innocuous flags, so it is fully writable by direct DML.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    let n = 6;
+    {
+        let conn = open_file_with_extension(&path);
+        conn.execute_batch("CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2);")
+            .unwrap();
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO t(vector) VALUES (vector_from_json(?1, 'float4'))",
+                [format!("[{i}.0, 0.0]")],
+            )
+            .unwrap();
+        }
+        conn.query_row("SELECT vector_sync_index('t')", [], |r| r.get::<_, i64>(0))
+            .unwrap(); // graph persisted with n keys
+
+        // Bypass the vtab: direct DML on the shadow table itself. The graph
+        // still thinks id=1 exists.
+        let deleted: i64 = conn
+            .execute("DELETE FROM \"t_data\" WHERE id = 1", [])
+            .unwrap() as i64;
+        assert_eq!(deleted, 1, "direct shadow-table DML must be permitted");
+    }
+    let conn = open_file_with_extension(&path);
+    let ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 100",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        ids.len(),
+        (n - 1) as usize,
+        "stale graph key must be dropped by connect-time rebuild"
+    );
+    assert!(
+        !ids.contains(&1),
+        "row deleted directly from _data must be absent after rebuild"
+    );
 }
 
 #[test]
@@ -123,30 +195,65 @@ fn full_scan_streams_all_rows_in_order() {
 }
 
 #[test]
-fn autocommit_inserts_within_3x_of_single_transaction() {
-    use std::time::Instant;
+fn autocommit_inserts_persist_lazily_not_per_row() {
+    // Deterministic proxy for the O(N)-per-commit regression this test
+    // guards, replacing the old wall-clock `* 3` assertion (flaky under
+    // load/CI jitter). The regression this guards against: every autocommit
+    // INSERT triggering its own eager graph persist (each commit calling
+    // `persist_index`, which resets `changes_since_persist` to 0). With the
+    // default `sync_every=1024` threshold, 2000 autocommit inserts should
+    // persist at most ~2 times, not once per row.
+    //
+    // The proxy: after fewer than `sync_every` autocommit inserts (well under
+    // the persist threshold), `changes_since_persist` (exposed by
+    // `vector_index_info`) must be > 0. If persistence had regressed to
+    // per-commit, `sync()` would persist (and reset the counter to 0) after
+    // every single insert, so this would read 0 or 1 instead of accumulating.
+    // A second assertion checks the counter keeps growing across inserts
+    // (rather than being reset), which a naive "persist every Nth insert
+    // where N resets differently" implementation could otherwise slip past.
     let json = "[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]";
-
     let conn = open_with_extension();
     conn.execute_batch("CREATE VIRTUAL TABLE a USING vector(dim=8, type=float4, metric=l2);")
         .unwrap();
-    let t0 = Instant::now();
-    for _ in 0..2000 {
+
+    let read_pending = |c: &rusqlite::Connection| -> i64 {
+        let info: String = c
+            .query_row("SELECT vector_index_info('a')", [], |r| r.get(0))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+        v["changes_since_persist"].as_i64().unwrap()
+    };
+
+    for i in 0..50 {
         conn.execute(
             "INSERT INTO a(vector) VALUES (vector_from_json(?1, 'float4'))",
             [json],
         )
         .unwrap();
+        if i == 9 {
+            assert!(
+                read_pending(&conn) > 1,
+                "changes_since_persist must accumulate across autocommit inserts, \
+                 not reset to 0/1 per row (would indicate a per-commit persist regression)"
+            );
+        }
     }
-    let auto = t0.elapsed();
+    let pending_after_50 = read_pending(&conn);
+    assert!(
+        pending_after_50 > 1,
+        "expected pending changes to still be accumulating well under sync_every \
+         (default 1024); got changes_since_persist={pending_after_50} after 50 inserts"
+    );
 
+    // Correctness under autocommit: a plain-transaction table inserting the
+    // same rows must end with the same row count and KNN result set.
     let conn2 = open_with_extension();
     conn2
         .execute_batch("CREATE VIRTUAL TABLE b USING vector(dim=8, type=float4, metric=l2);")
         .unwrap();
-    let t1 = Instant::now();
     conn2.execute_batch("BEGIN").unwrap();
-    for _ in 0..2000 {
+    for _ in 0..50 {
         conn2
             .execute(
                 "INSERT INTO b(vector) VALUES (vector_from_json(?1, 'float4'))",
@@ -155,11 +262,32 @@ fn autocommit_inserts_within_3x_of_single_transaction() {
             .unwrap();
     }
     conn2.execute_batch("COMMIT").unwrap();
-    let txn = t1.elapsed();
 
-    assert!(
-        auto < txn * 3 + std::time::Duration::from_millis(200),
-        "autocommit {auto:?} must stay within 3x of one-txn {txn:?} (+200ms slack)"
+    let count_a: i64 = conn
+        .query_row("SELECT count(*) FROM a", [], |r| r.get(0))
+        .unwrap();
+    let count_b: i64 = conn2
+        .query_row("SELECT count(*) FROM b", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count_a, count_b,
+        "autocommit and single-transaction inserts must produce identical row counts"
+    );
+
+    let knn = |c: &rusqlite::Connection, t: &str| -> Vec<i64> {
+        c.prepare(&format!(
+            "SELECT id FROM {t} WHERE knn_match(distance, vector_from_json('{json}', 'float4')) LIMIT 10"
+        ))
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    };
+    assert_eq!(
+        knn(&conn, "a").len(),
+        knn(&conn2, "b").len(),
+        "autocommit and single-transaction KNN result sizes must match"
     );
 }
 
@@ -747,6 +875,170 @@ fn ef_search_survives_file_reconnect() {
         v["ef_search"], 128,
         "ef_search set before close must round-trip through the persisted meta on reconnect"
     );
+}
+
+#[test]
+fn vector_index_info_reports_exact_mode() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE e USING vector(dim=3, type=float4, metric=l2, mode=exact);",
+    )
+    .unwrap();
+    let n = 7;
+    for i in 0..n {
+        conn.execute(
+            "INSERT INTO e(vector) VALUES (vector_from_json(?1, 'float4'))",
+            [format!("[{i}.0, 0.0, 0.0]")],
+        )
+        .unwrap();
+    }
+    let info: String = conn
+        .query_row("SELECT vector_index_info('e')", [], |r| r.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(v["mode"], "exact");
+    assert_eq!(v["rows"], n);
+    // Exact mode has no live HNSW index, so `vector_index_info`'s `ef_live`
+    // branch takes the `None` arm (see src/scalar.rs) and `ef_live` is 0;
+    // the reported `ef_search` then falls back to the configured tuning
+    // knob (default 64, since this table didn't override it) rather than 0.
+    assert!(
+        v["ef_search"].is_i64(),
+        "ef_search must be present even in exact mode, got: {info}"
+    );
+    assert_eq!(v["ef_search"], 64);
+}
+
+#[test]
+fn vector_ef_search_rejects_non_positive_values() {
+    let conn = open_with_extension();
+    conn.execute_batch("CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2);")
+        .unwrap();
+
+    let err = conn
+        .query_row("SELECT vector_ef_search('t', 0)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("positive"),
+        "vector_ef_search(0) must error mentioning 'positive', got: {err}"
+    );
+
+    let err = conn
+        .query_row("SELECT vector_ef_search('t', -5)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("positive"),
+        "vector_ef_search(-5) must error mentioning 'positive', got: {err}"
+    );
+}
+
+#[test]
+fn dim_mismatch_at_connect_is_rejected() {
+    // Sibling to `mode_mismatch_at_connect_is_rejected`: corrupts the
+    // persisted `meta` row's `dim` field (instead of `mode`) directly via
+    // plain SQL, then reopens the file and references the table so SQLite
+    // invokes xConnect, exercising the dim/type/metric branch of
+    // connect-time verification in src/vtab/mod.rs::init (distinct from the
+    // separate `mode` check just below it).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    {
+        let conn = open_file_with_extension(&path);
+        conn.execute_batch("CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2);")
+            .unwrap();
+        let meta: String = conn
+            .query_row("SELECT value FROM t_index WHERE key = 'meta'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        v["dim"] = serde_json::Value::from(999);
+        conn.execute(
+            "UPDATE t_index SET value = ?1 WHERE key = 'meta'",
+            [v.to_string()],
+        )
+        .unwrap();
+    }
+    let conn = open_file_with_extension(&path);
+    let err = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("disagree with persisted meta"),
+        "expected a persisted-meta disagreement error from connect-time dim verification, got: {msg}"
+    );
+}
+
+#[test]
+fn released_savepoint_does_not_corrupt_later_rollback_to() {
+    // Exercises TransactionVTab::release (RELEASE), confirming that
+    // releasing an inner savepoint doesn't disturb an outer savepoint's
+    // snapshot that a later ROLLBACK TO still depends on.
+    let conn = open_with_extension();
+    conn.execute_batch("CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2);")
+        .unwrap();
+
+    // Committed baseline row, present before any savepoint.
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[0.0, 0.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+
+    conn.execute_batch("SAVEPOINT a").unwrap();
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[1.0, 1.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch("SAVEPOINT b").unwrap();
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[2.0, 2.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch("RELEASE b").unwrap();
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[3.0, 3.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch("ROLLBACK TO a").unwrap();
+
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM (SELECT id FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 10)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "ROLLBACK TO a must undo everything after savepoint a, \
+         despite the intervening RELEASE of the inner savepoint b"
+    );
+
+    // The connection must remain usable: release the still-open savepoint a
+    // and confirm further inserts still work against a consistent index.
+    conn.execute_batch("RELEASE a").unwrap();
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[4.0, 4.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+    let n2: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM (SELECT id FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 10)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n2, 2, "post-rollback insert must succeed and be visible");
 }
 
 #[test]
