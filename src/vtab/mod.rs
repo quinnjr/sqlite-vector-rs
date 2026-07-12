@@ -355,6 +355,7 @@ fn build_vtab<'vtab>(
             dirty: false,
             last_committed: None,
             changes_since_persist: 0,
+            destructive_since_persist: false,
         }))
     } else {
         // Try to reload a previously persisted index; fall back to a fresh one.
@@ -390,6 +391,7 @@ fn build_vtab<'vtab>(
             dirty: false,
             last_committed: Some(snapshot),
             changes_since_persist: 0,
+            destructive_since_persist: false,
         }))
     };
 
@@ -652,6 +654,11 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                     if s.index.is_some() {
                         s.dirty = true;
                         s.changes_since_persist += 1;
+                        // Deletes remove an existing graph key; reconcile-on-
+                        // connect only re-adds keys that are *missing*, so an
+                        // unpersisted delete must be forced out eagerly (see
+                        // Finding 1, IndexState::destructive_since_persist).
+                        s.destructive_since_persist = true;
                     }
                 }
                 Ok(0)
@@ -832,6 +839,12 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                         if s.index.is_some() {
                             s.dirty = true;
                             s.changes_since_persist += 1;
+                            // An UPDATE re-keys/re-embeds an existing graph
+                            // entry in place; `index.contains(id)` stays true
+                            // so reconcile-on-connect would skip it and serve
+                            // the stale embedding. Force an eager persist
+                            // (see Finding 1).
+                            s.destructive_since_persist = true;
                         }
                     }
                 }

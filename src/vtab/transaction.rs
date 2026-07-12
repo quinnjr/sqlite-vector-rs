@@ -16,6 +16,16 @@ pub struct IndexState {
     pub dirty: bool,
     pub last_committed: Option<Vec<u8>>,
     pub changes_since_persist: u64,
+    /// Set by Update/Delete (never by plain Insert — see Finding 1 in the
+    /// post-review fix wave): tracks whether a destructive change to an
+    /// *existing* graph key happened since the last persist. Reconcile-on-
+    /// connect only detects rows missing from the graph (`!index.contains`)
+    /// or a `len() != count` mismatch; it cannot detect a key that's present
+    /// but stale (updated in place, or deleted-then-reinserted with the same
+    /// id and a different vector). Forcing an eager persist on any
+    /// destructive op sidesteps that blind spot without giving up the
+    /// insert-side batching that `sync_every` exists for.
+    pub destructive_since_persist: bool,
 }
 
 pub struct VectorTransaction {
@@ -68,6 +78,7 @@ pub fn persist_index(db: &Connection, table_name: &str, s: &mut IndexState) -> R
 
     s.last_committed = Some(buf);
     s.changes_since_persist = 0;
+    s.destructive_since_persist = false;
     s.dirty = false;
     Ok(())
 }
@@ -75,7 +86,7 @@ pub fn persist_index(db: &Connection, table_name: &str, s: &mut IndexState) -> R
 impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
     fn sync(&mut self) -> Result<()> {
         let mut s = self.state.borrow_mut();
-        if s.dirty && s.changes_since_persist >= self.sync_every {
+        if s.dirty && (s.destructive_since_persist || s.changes_since_persist >= self.sync_every) {
             let db = unsafe { &*self.db };
             persist_index(db, &self.table_name, &mut s)?;
         }
@@ -117,6 +128,7 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
             // future explicit `vector_sync_index`) catch up. This matches
             // the "reset to 0" fallback called out in the review finding.
             s.changes_since_persist = 0;
+            s.destructive_since_persist = false;
         }
         // `last_committed` may predate commits that survived this rollback
         // (rows persisted to `_data` before the rollback but never persisted

@@ -446,3 +446,136 @@ fn vector_utility_functions() {
         )
         .is_err(), "out-of-bounds slice must error");
 }
+
+#[test]
+fn unpersisted_update_is_not_stale_after_reconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    {
+        let conn = open_file_with_extension(&path);
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2, sync_every=1000000);
+             INSERT INTO t(vector) VALUES (vector_from_json('[0.0, 0.0]', 'float4'));
+             INSERT INTO t(vector) VALUES (vector_from_json('[1.0, 1.0]', 'float4'));",
+        )
+        .unwrap();
+        conn.query_row("SELECT vector_sync_index('t')", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        // Unpersisted destructive UPDATE: id 1's vector moves far away.
+        conn.execute(
+            "UPDATE t SET vector = vector_from_json('[100.0, 100.0]', 'float4') WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    } // dropped without ever reaching the persist threshold
+    let conn = open_file_with_extension(&path);
+    let ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM t WHERE knn_match(distance, vector_from_json('[100.0, 100.0]', 'float4')) LIMIT 10",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        ids.first(),
+        Some(&1),
+        "reconnect must serve id 1's NEW vector, not the stale graph embedding"
+    );
+}
+
+#[test]
+fn unpersisted_delete_reinsert_same_id_not_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    {
+        let conn = open_file_with_extension(&path);
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2, sync_every=1000000);
+             INSERT INTO t(vector) VALUES (vector_from_json('[0.0, 0.0]', 'float4'));
+             INSERT INTO t(vector) VALUES (vector_from_json('[1.0, 1.0]', 'float4'));",
+        )
+        .unwrap();
+        conn.query_row("SELECT vector_sync_index('t')", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        // Unpersisted destructive DELETE + re-INSERT of the same id with a
+        // different (far) vector.
+        conn.execute("DELETE FROM t WHERE id = 1", []).unwrap();
+        conn.execute(
+            "INSERT INTO t(id, vector) VALUES (1, vector_from_json('[200.0, 200.0]', 'float4'))",
+            [],
+        )
+        .unwrap();
+    } // dropped without ever reaching the persist threshold
+    let conn = open_file_with_extension(&path);
+    let ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM t WHERE knn_match(distance, vector_from_json('[200.0, 200.0]', 'float4')) LIMIT 10",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        ids.first(),
+        Some(&1),
+        "reconnect must serve id 1's NEW (re-inserted) vector, not the stale deleted embedding"
+    );
+}
+
+#[test]
+fn mid_transaction_sync_then_rollback_recovers() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2, sync_every=1000000);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[0.0, 0.0]', 'float4'))",
+        [],
+    )
+    .unwrap(); // autocommit, committed row 1
+
+    conn.execute_batch("BEGIN").unwrap();
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[1.0, 1.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[2.0, 2.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+    // Persist mid-transaction (known hazard: persists uncommitted rows into
+    // last_committed).
+    conn.query_row("SELECT vector_sync_index('t')", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    conn.execute_batch("ROLLBACK").unwrap();
+
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM (SELECT id FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 10)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "rollback must leave exactly the 1 committed row");
+
+    // Insert again and confirm no duplicate-key failure / graph is usable.
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[3.0, 3.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+    let n2: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM (SELECT id FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 10)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n2, 2, "post-rollback insert must succeed with no duplicate-key error");
+}
