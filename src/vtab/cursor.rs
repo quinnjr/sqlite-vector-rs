@@ -7,8 +7,8 @@ use sqlite3_ext::{
     vtab::{ColumnContext, VTabConnection, VTabCursor},
 };
 
+use crate::vtab::TableSql;
 use crate::vtab::config::VectorTableConfig;
-use crate::vtab::shadow::ShadowOps;
 use crate::vtab::transaction::IndexState;
 
 // Index number must match INDEX_KNN in mod.rs
@@ -45,6 +45,8 @@ pub struct VectorCursor {
     pub db: *const VTabConnection,
     /// Safety: valid for the vtab lifetime — VectorTable owns the config.
     pub config: *const VectorTableConfig,
+    /// Safety: valid for the vtab lifetime — VectorTable owns the prebuilt SQL.
+    pub sql: *const TableSql,
     pub state: Arc<RefCell<IndexState>>,
 }
 
@@ -92,9 +94,10 @@ impl VTabCursor for VectorCursor {
         _index_str: Option<&str>,
         args: &mut [&mut ValueRef],
     ) -> Result<()> {
-        // Safety: db and config pointers are valid for the vtab lifetime.
+        // Safety: db, config, and sql pointers are valid for the vtab lifetime.
         let db = unsafe { &*self.db };
         let config = unsafe { &*self.config };
+        let sql = unsafe { &*self.sql };
 
         match index_num {
             INDEX_KNN => {
@@ -119,13 +122,17 @@ impl VTabCursor for VectorCursor {
                     .search(&query_blob, k)
                     .map_err(|e| Error::Module(e.to_string()))?;
 
+                let num_meta = config.metadata_columns.len();
+                let mut stmt = db.prepare(&sql.fetch_by_id)?;
                 let mut results = Vec::with_capacity(hits.len());
                 for (key, dist) in hits {
-                    if let Some(row) = fetch_row_by_id(db, config, key as i64)? {
+                    stmt.query([key as i64])?;
+                    if let Some(row) = stmt.next()? {
+                        let r = read_scan_row(row, num_meta)?;
                         results.push(KnnRow {
-                            id: row.id,
-                            vector: row.vector,
-                            metadata: row.metadata,
+                            id: r.id,
+                            vector: r.vector,
+                            metadata: r.metadata,
                             distance: dist as f64,
                         });
                     }
@@ -133,7 +140,7 @@ impl VTabCursor for VectorCursor {
                 self.mode = CursorMode::Knn { results, pos: 0 };
             }
             _ => {
-                let mut stmt = db.prepare(&ShadowOps::select_all_data_sql(&config.table_name))?;
+                let mut stmt = db.prepare(&sql.scan_all)?;
                 stmt.query(())?;
                 let mut mode = CursorMode::Scan {
                     stmt,
@@ -224,19 +231,4 @@ fn advance_scan(mode: &mut CursorMode, num_meta: usize) -> Result<()> {
         };
     }
     Ok(())
-}
-
-fn fetch_row_by_id(
-    db: &VTabConnection,
-    config: &VectorTableConfig,
-    id: i64,
-) -> Result<Option<ScanRow>> {
-    use sqlite3_ext::SQLITE_EMPTY;
-    let sql = ShadowOps::select_data_sql(&config.table_name);
-    let num_meta = config.metadata_columns.len();
-    match db.query_row(&sql, [id], |row| read_scan_row(row, num_meta)) {
-        Ok(row) => Ok(Some(row)),
-        Err(ref e) if *e == SQLITE_EMPTY => Ok(None),
-        Err(e) => Err(e),
-    }
 }

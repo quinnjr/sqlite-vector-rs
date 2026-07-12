@@ -29,6 +29,34 @@ const INDEX_KNN: i32 = 1;
 /// Default ANN candidate count when no LIMIT is safely consumable as k.
 pub const DEFAULT_KNN_K: usize = 100;
 
+/// Shadow-table SQL strings built once per table (at connect/create time)
+/// instead of `format!`-ed on every operation. `update` is intentionally
+/// absent here: `ShadowOps::update_data_sql` varies per-call on which
+/// columns actually changed (id/vector/metadata), so it cannot be
+/// prebuilt — the `Update` arm of `UpdateVTab::update` still calls
+/// `ShadowOps::update_data_sql` directly.
+pub struct TableSql {
+    pub insert: String,
+    pub insert_with_id: String,
+    pub delete: String,
+    pub fetch_by_id: String,
+    pub scan_all: String,
+    pub ids_vectors: String,
+}
+
+impl TableSql {
+    pub fn new(config: &VectorTableConfig) -> Self {
+        Self {
+            insert: ShadowOps::insert_data_sql(config),
+            insert_with_id: ShadowOps::insert_data_with_id_sql(config),
+            delete: ShadowOps::delete_data_sql(&config.table_name),
+            fetch_by_id: ShadowOps::select_data_sql(&config.table_name),
+            scan_all: ShadowOps::select_all_data_sql(&config.table_name),
+            ids_vectors: ShadowOps::select_ids_vectors_sql(&config.table_name),
+        }
+    }
+}
+
 /// The virtual table implementation for vector search.
 ///
 /// `db` is a raw pointer to the VTabConnection that SQLite provides to connect/create.
@@ -36,6 +64,7 @@ pub const DEFAULT_KNN_K: usize = 100;
 /// for the entire lifetime of VectorTable.
 pub struct VectorTable<'vtab> {
     config: VectorTableConfig,
+    sql: TableSql,
     state: Arc<RefCell<IndexState>>,
     /// Safety: valid for 'vtab lifetime — SQLite keeps the connection alive.
     db: *const VTabConnection,
@@ -91,17 +120,13 @@ fn load_meta_from_shadow(
 /// Insert a new row into `_data` and return the auto-assigned rowid.
 fn insert_into_data_shadow(
     db: &VTabConnection,
-    config: &VectorTableConfig,
+    sql: &str,
     explicit_id: Option<i64>,
     vector_blob: &[u8],
     metadata_args: &mut [&mut ValueRef],
 ) -> Result<i64> {
     use sqlite3_ext::query::Statement;
-    let sql = match explicit_id {
-        Some(_) => ShadowOps::insert_data_with_id_sql(config),
-        None => ShadowOps::insert_data_sql(config),
-    };
-    db.insert(&sql, |stmt: &mut Statement| {
+    db.insert(sql, |stmt: &mut Statement| {
         let mut i = 1;
         if let Some(id) = explicit_id {
             id.bind_param(&mut *stmt, i)?;
@@ -118,21 +143,19 @@ fn insert_into_data_shadow(
 }
 
 /// Delete a row from `_data` by rowid.
-fn delete_from_data_shadow(db: &VTabConnection, table_name: &str, rowid: i64) -> Result<()> {
-    let sql = ShadowOps::delete_data_sql(table_name);
-    db.execute(&sql, [rowid])?;
+fn delete_from_data_shadow(db: &VTabConnection, sql: &str, rowid: i64) -> Result<()> {
+    db.execute(sql, [rowid])?;
     Ok(())
 }
 
 /// Fetch a row from `_data` by rowid, returning (id, vector) or None if not found.
 fn fetch_row_from_shadow(
     db: &VTabConnection,
-    config: &VectorTableConfig,
+    sql: &str,
     rowid: i64,
 ) -> Result<Option<(i64, Vec<u8>)>> {
     use sqlite3_ext::SQLITE_EMPTY;
-    let sql = ShadowOps::select_data_sql(&config.table_name);
-    match db.query_row(&sql, [rowid], |row| {
+    match db.query_row(sql, [rowid], |row| {
         let id = row[0].get_i64();
         let vector = row[1].get_blob()?.to_vec();
         Ok((id, vector))
@@ -362,8 +385,11 @@ fn build_vtab<'vtab>(
         |ctx: &Context, _args: &mut [&mut ValueRef]| ctx.set_result(1i32),
     );
 
+    let sql = TableSql::new(&config);
+
     let vtab = VectorTable {
         config,
+        sql,
         state,
         db: db as *const VTabConnection,
         functions,
@@ -465,6 +491,7 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
             num_metadata_cols: self.config.metadata_columns.len(),
             db: self.db,
             config: &self.config as *const VectorTableConfig,
+            sql: &self.sql as *const TableSql,
             state: Arc::clone(&self.state),
         })
     }
@@ -520,7 +547,7 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
         match info.change_type() {
             ChangeType::Delete => {
                 let rowid = info.rowid().get_i64();
-                delete_from_data_shadow(db, &self.config.table_name, rowid)?;
+                delete_from_data_shadow(db, &self.sql.delete, rowid)?;
                 self.state
                     .borrow()
                     .index
@@ -562,7 +589,13 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                     .validate_finite(&vector_blob, self.config.dim)
                     .map_err(|e| Error::Module(e.to_string()))?;
 
-                let rowid = insert_into_data_shadow(db, &self.config, explicit_id, &vector_blob, meta_args)?;
+                let insert_sql = if explicit_id.is_some() {
+                    &self.sql.insert_with_id
+                } else {
+                    &self.sql.insert
+                };
+                let rowid =
+                    insert_into_data_shadow(db, insert_sql, explicit_id, &vector_blob, meta_args)?;
 
                 let state = self.state.borrow();
                 state
@@ -640,7 +673,7 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 // row (once the row's id changes, it's no longer reachable at
                 // old_rowid).
                 let reindex_vector: Option<Vec<u8>> = if needs_reindex && vector_blob.is_none() {
-                    match fetch_row_from_shadow(db, &self.config, old_rowid)? {
+                    match fetch_row_from_shadow(db, &self.sql.fetch_by_id, old_rowid)? {
                         Some((_, v)) => Some(v),
                         None => {
                             return Err(Error::Module(format!(
