@@ -254,3 +254,34 @@ fn insert_duplicate_rowid_errors() {
     );
     assert!(err.is_err(), "duplicate explicit rowid must be a constraint error");
 }
+
+#[test]
+fn metadata_columns_keep_declared_types() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE m USING vector(dim=2, type=float4, metric=l2, metadata=\"label TEXT, score REAL\");
+         INSERT INTO m(vector, label, score) VALUES (vector_from_json('[0.0, 0.0]', 'float4'), 'a', 1.5);",
+    )
+    .unwrap();
+    let (t_label, t_score): (String, String) = conn
+        .query_row("SELECT typeof(label), typeof(score) FROM m", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((t_label.as_str(), t_score.as_str()), ("text", "real"));
+
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM m WHERE label = 'a' AND score > 1.0", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "metadata filters must match typed values");
+
+    // KNN mode must preserve types too.
+    let t_knn: String = conn
+        .query_row(
+            "SELECT typeof(label) FROM m WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(t_knn, "text");
+}

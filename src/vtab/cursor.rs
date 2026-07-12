@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use sqlite3_ext::{
-    Error, FallibleIteratorMut, FromValue, Result, ValueRef,
+    Error, FallibleIteratorMut, FromValue, Result, Value, ValueRef,
     vtab::{ColumnContext, VTabConnection, VTabCursor},
 };
 
@@ -21,13 +21,13 @@ pub enum CursorMode {
 pub struct ScanRow {
     pub id: i64,
     pub vector: Vec<u8>,
-    pub metadata: Vec<Option<Vec<u8>>>,
+    pub metadata: Vec<Value>,
 }
 
 pub struct KnnRow {
     pub id: i64,
     pub vector: Vec<u8>,
-    pub metadata: Vec<Option<Vec<u8>>>,
+    pub metadata: Vec<Value>,
     pub distance: f64,
 }
 
@@ -60,7 +60,7 @@ impl VectorCursor {
         }
     }
 
-    fn current_metadata(&self) -> &[Option<Vec<u8>>] {
+    fn current_metadata(&self) -> &[Value] {
         match &self.mode {
             CursorMode::Scan { rows, pos } => &rows[*pos].metadata,
             CursorMode::Knn { results, pos } => &results[*pos].metadata,
@@ -172,11 +172,7 @@ impl VTabCursor for VectorCursor {
                 ctx.set_result(self.current_vector())?;
             }
             i if i >= 2 && i < 2 + self.num_metadata_cols => {
-                let meta_idx = i - 2;
-                match &self.current_metadata()[meta_idx] {
-                    Some(blob) => ctx.set_result(blob.as_slice())?,
-                    None => ctx.set_result(())?,
-                }
+                ctx.set_result(self.current_metadata()[i - 2].clone())?;
             }
             _ => {
                 // distance column (last)
@@ -209,11 +205,7 @@ fn scan_all_rows(db: &VTabConnection, config: &VectorTableConfig) -> Result<Vec<
         let vector = row[1].get_blob()?.to_vec();
         let mut metadata = Vec::with_capacity(num_meta);
         for i in 0..num_meta {
-            if row[2 + i].is_null() {
-                metadata.push(None);
-            } else {
-                metadata.push(Some(row[2 + i].get_blob()?.to_vec()));
-            }
+            metadata.push(row[2 + i].to_owned()?);
         }
         rows.push(ScanRow {
             id,
@@ -237,11 +229,7 @@ fn fetch_row_by_id(
         let vector = row[1].get_blob()?.to_vec();
         let mut metadata = Vec::with_capacity(num_meta);
         for i in 0..num_meta {
-            if row[2 + i].is_null() {
-                metadata.push(None);
-            } else {
-                metadata.push(Some(row[2 + i].get_blob()?.to_vec()));
-            }
+            metadata.push(row[2 + i].to_owned()?);
         }
         Ok(ScanRow {
             id,
