@@ -48,6 +48,21 @@ impl ShadowOps {
         )
     }
 
+    pub fn insert_data_with_id_sql(config: &VectorTableConfig) -> String {
+        let mut col_names = vec!["id".to_string(), "vector".to_string()];
+        let mut placeholders = vec!["?".to_string(), "?".to_string()];
+        for (name, _) in &config.metadata_columns {
+            col_names.push(name.clone());
+            placeholders.push("?".to_string());
+        }
+        format!(
+            "INSERT INTO \"{}_data\"({}) VALUES({})",
+            config.table_name,
+            col_names.join(", "),
+            placeholders.join(", ")
+        )
+    }
+
     pub fn insert_vector_only_sql(table_name: &str) -> String {
         format!("INSERT INTO \"{table_name}_data\"(vector) VALUES(?)")
     }

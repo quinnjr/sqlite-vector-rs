@@ -172,3 +172,37 @@ fn update_id_only_retains_vector_and_metadata() {
         "vector must survive an id-only UPDATE, re-keyed under the new id"
     );
 }
+
+#[test]
+fn insert_with_explicit_rowid() {
+    let conn = open_with_extension();
+    create_2d(&conn);
+    conn.execute_batch(
+        "INSERT INTO t(id, vector) VALUES (42, vector_from_json('[2.0, 2.0]', 'float4'));",
+    )
+    .unwrap();
+    let id: i64 = conn.query_row("SELECT id FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(id, 42);
+    let nearest: i64 = conn
+        .query_row(
+            "SELECT id FROM t WHERE knn_match(distance, vector_from_json('[2.0, 2.0]', 'float4')) LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(nearest, 42);
+}
+
+#[test]
+fn insert_duplicate_rowid_errors() {
+    let conn = open_with_extension();
+    create_2d(&conn);
+    conn.execute_batch(
+        "INSERT INTO t(id, vector) VALUES (5, vector_from_json('[1.0, 0.0]', 'float4'));",
+    )
+    .unwrap();
+    let err = conn.execute_batch(
+        "INSERT INTO t(id, vector) VALUES (5, vector_from_json('[0.0, 1.0]', 'float4'));",
+    );
+    assert!(err.is_err(), "duplicate explicit rowid must be a constraint error");
+}

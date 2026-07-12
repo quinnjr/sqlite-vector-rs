@@ -70,15 +70,26 @@ fn save_meta_to_shadow(db: &VTabConnection, table_name: &str, meta_json: &str) -
 fn insert_into_data_shadow(
     db: &VTabConnection,
     config: &VectorTableConfig,
+    explicit_id: Option<i64>,
     vector_blob: &[u8],
     metadata_args: &mut [&mut ValueRef],
 ) -> Result<i64> {
     use sqlite3_ext::query::Statement;
-    let sql = ShadowOps::insert_data_sql(config);
+    let sql = match explicit_id {
+        Some(_) => ShadowOps::insert_data_with_id_sql(config),
+        None => ShadowOps::insert_data_sql(config),
+    };
     db.insert(&sql, |stmt: &mut Statement| {
-        vector_blob.bind_param(&mut *stmt, 1)?;
-        for (i, val) in metadata_args.iter_mut().enumerate() {
-            val.bind_param(&mut *stmt, (i + 2) as i32)?;
+        let mut i = 1;
+        if let Some(id) = explicit_id {
+            id.bind_param(&mut *stmt, i)?;
+            i += 1;
+        }
+        vector_blob.bind_param(&mut *stmt, i)?;
+        i += 1;
+        for val in metadata_args.iter_mut() {
+            val.bind_param(&mut *stmt, i)?;
+            i += 1;
         }
         Ok(())
     })
@@ -307,6 +318,13 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 //   args[2] = col 1 (vector)
                 //   args[3..3+N] = metadata cols
                 //   args[3+N] = distance (hidden, ignored on insert)
+                let explicit_id = if !args[0].is_null() {
+                    Some(args[0].get_i64())
+                } else if !args[1].is_null() {
+                    Some(args[1].get_i64())
+                } else {
+                    None
+                };
                 let vector_blob = args[2].get_blob()?.to_vec();
                 let num_meta = self.config.metadata_columns.len();
                 let meta_args = &mut args[3..3 + num_meta];
@@ -321,7 +339,7 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                     .validate_finite(&vector_blob, self.config.dim)
                     .map_err(|e| Error::Module(e.to_string()))?;
 
-                let rowid = insert_into_data_shadow(db, &self.config, &vector_blob, meta_args)?;
+                let rowid = insert_into_data_shadow(db, &self.config, explicit_id, &vector_blob, meta_args)?;
 
                 let state = self.state.borrow();
                 state
