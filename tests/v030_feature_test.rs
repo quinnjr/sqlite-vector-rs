@@ -264,6 +264,42 @@ fn exact_mode_respects_filters_and_limit() {
 }
 
 #[test]
+fn duplicate_metadata_constraints_do_not_crash_best_index() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE dup_hnsw USING vector(dim=2, type=float4, metric=l2, metadata=\"score REAL\");
+         CREATE VIRTUAL TABLE dup_exact USING vector(dim=2, type=float4, metric=l2, mode=exact, metadata=\"score REAL\");",
+    )
+    .unwrap();
+    for t in ["dup_hnsw", "dup_exact"] {
+        for i in 0..5 {
+            conn.execute(
+                &format!("INSERT INTO {t}(vector, score) VALUES (vector_from_json(?1, 'float4'), ?2)"),
+                rusqlite::params![format!("[{}.0, 0.0]", i), i as f64],
+            )
+            .unwrap();
+        }
+    }
+    for t in ["dup_hnsw", "dup_exact"] {
+        // Two constraints on the SAME (column, op) pair used to make best_index
+        // assign the same argv slot twice, leaving a gap SQLite rejects with
+        // "xBestIndex malfunction". The correct result is the intersection:
+        // score > 1.0 AND score > 3.0 == score > 3.0, i.e. ids where score is 4.0.
+        let ids: Vec<i64> = conn
+            .prepare(&format!(
+                "SELECT id FROM {t} WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4'))
+                 AND score > 1.0 AND score > 3.0 LIMIT 5"
+            ))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids, vec![5], "table {t}: expected only the row with score=4.0 (id=5)");
+    }
+}
+
+#[test]
 fn index_info_reports_state_and_ef_search_is_adjustable() {
     let conn = open_with_extension();
     conn.execute_batch(

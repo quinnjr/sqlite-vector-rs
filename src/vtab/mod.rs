@@ -495,8 +495,19 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
         // than relying on iteration order: knn function constraint first,
         // then limit, then each pushed filter in `filters` order. Filters are
         // left un-omitted so SQLite double-checks them.
+        //
+        // Each constraint may only be assigned an argv slot ONCE. When two
+        // constraints share the same (column, op) — e.g. `score > 1.0 AND
+        // score > 3.0` — a naive rescan-from-start would match the *first*
+        // one for every filters-list entry, leaving a later constraint with
+        // no argv_index and creating a gap that SQLite rejects as an
+        // "xBestIndex malfunction". `IndexInfoConstraintIterator` always
+        // yields constraints in the same stable position order across calls,
+        // so a position-index set is enough to make argv assignment
+        // one-to-one with constraints.
+        let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut argv_next: u32 = 1;
-        for mut c in info.constraints() {
+        for (pos, mut c) in info.constraints().enumerate() {
             if c.usable()
                 && c.column() == distance_col
                 && matches!(c.op(), ConstraintOp::Function(_))
@@ -504,19 +515,21 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
                 c.set_argv_index(Some(argv_next - 1));
                 c.set_omit(true);
                 argv_next += 1;
+                used.insert(pos);
             }
         }
         if take_limit {
-            for mut c in info.constraints() {
+            for (pos, mut c) in info.constraints().enumerate() {
                 if c.usable() && matches!(c.op(), ConstraintOp::Limit) {
                     c.set_argv_index(Some(argv_next - 1));
                     argv_next += 1;
+                    used.insert(pos);
                 }
             }
         }
         for (filter_col, filter_op) in &filters {
-            for mut c in info.constraints() {
-                if !c.usable() || c.column() != *filter_col {
+            for (pos, mut c) in info.constraints().enumerate() {
+                if used.contains(&pos) || !c.usable() || c.column() != *filter_col {
                     continue;
                 }
                 let op = match c.op() {
@@ -530,6 +543,7 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
                 if op == *filter_op {
                     c.set_argv_index(Some(argv_next - 1));
                     argv_next += 1;
+                    used.insert(pos);
                     break;
                 }
             }
