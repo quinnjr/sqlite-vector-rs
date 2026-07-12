@@ -49,6 +49,9 @@ pub struct VectorCursor {
 }
 
 // Safety: VectorCursor is only ever accessed from a single thread by SQLite.
+// This covers the raw db/config pointers and the owned `Statement` inside
+// `CursorMode::Scan` (which wraps a live `sqlite3_stmt*`): all are created and
+// used exclusively under SQLite's one-thread-per-connection guarantee.
 unsafe impl Send for VectorCursor {}
 unsafe impl Sync for VectorCursor {}
 
