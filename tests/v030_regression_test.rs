@@ -385,3 +385,61 @@ fn vector_sync_index_disambiguates_same_named_tables_across_databases() {
         .unwrap();
     assert_eq!(result, 1);
 }
+
+#[test]
+fn drop_and_recreate_same_name_does_not_leave_stale_registry_entry() {
+    // Finding 1: destroy() (DROP TABLE) must remove the registry entry for
+    // the dropped table so a same-named table created afterwards is the
+    // *only* match for its bare name — a stale dead-Weak entry under the
+    // same key would otherwise make the fresh table look ambiguous.
+    let conn = open_with_extension();
+    create_2d(&conn);
+    insert_json(&conn, "[1.0, 0.0]");
+    conn.execute_batch("DROP TABLE t;").unwrap();
+
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2, sync_every=1000000);
+         INSERT INTO t(vector) VALUES (vector_from_json('[0.0, 1.0]', 'float4'));",
+    )
+    .unwrap();
+
+    // Must succeed with no ambiguity error and no stale state from the
+    // dropped table.
+    let n: i64 = conn
+        .query_row("SELECT vector_sync_index('t')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn drop_main_then_create_aux_same_name_resolves_unambiguously() {
+    // Finding 1: dropping main.t must remove its registry entry outright
+    // (not just leave a dead Weak on the get() path) so a subsequently
+    // created aux.t is the *sole* live entry for the bare name 't' —
+    // resolving to aux.t's own "not supported for attached databases"
+    // error, not a spurious "ambiguous table name" error.
+    let conn = open_with_extension();
+    create_2d(&conn);
+    insert_json(&conn, "[1.0, 0.0]");
+    conn.execute_batch("DROP TABLE t;").unwrap();
+
+    conn.execute_batch(
+        "ATTACH ':memory:' AS aux;
+         CREATE VIRTUAL TABLE aux.t USING vector(dim=2, type=float4, metric=l2);
+         INSERT INTO aux.t(vector) VALUES (vector_from_json('[0.0, 1.0]', 'float4'));",
+    )
+    .unwrap();
+
+    let err = conn
+        .query_row("SELECT vector_sync_index('t')", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("ambiguous"),
+        "must not report ambiguity once main.t's entry is gone, got: {msg}"
+    );
+    assert!(
+        msg.contains("attached database") && msg.contains("aux"),
+        "expected aux.t's own non-main rejection, got: {msg}"
+    );
+}

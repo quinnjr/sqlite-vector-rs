@@ -69,6 +69,10 @@ pub struct VectorTable<'vtab> {
     /// Safety: valid for 'vtab lifetime — SQLite keeps the connection alive.
     db: *const VTabConnection,
     functions: VTabFunctionList<'vtab, Self>,
+    /// Cloned handle to the same registry the table registered itself in at
+    /// connect/create time. `disconnect()` doesn't receive `Aux`, so this is
+    /// how it can remove its own entry (see Finding 1).
+    registry: Registry,
 }
 
 // Safety: VectorTable is only ever accessed from a single thread by SQLite's
@@ -202,45 +206,68 @@ impl Registry {
         );
     }
 
+    /// Remove the exact `db.table` entry, if present. Called from both
+    /// `destroy()` (DROP TABLE) and the vtab's `disconnect()` path so dead
+    /// entries never linger to participate in bare-name suffix matching
+    /// (see Finding 1: a dropped `main.t` must not make a freshly created
+    /// `aux.t` look "ambiguous" under the bare name `t`) and so long-lived
+    /// connections don't grow the map unboundedly.
+    pub fn unregister(&self, db_name: &str, table_name: &str) {
+        let key = format!("{db_name}.{table_name}");
+        self.0.lock().unwrap().remove(&key);
+    }
+
     /// Look up a registered table by name. `name` may be a qualified
     /// `db.table` (exact match against the registry key) or a bare
     /// `table` (matched by suffix against `.table` across all registered
     /// entries). A bare name that matches more than one entry is
     /// ambiguous and returns an error rather than silently picking one.
+    ///
+    /// Entries whose `Weak` can no longer be upgraded (the vtab was
+    /// disconnected/destroyed without going through `unregister`, e.g. an
+    /// older sqlite3_ext version that never called our disconnect hook) are
+    /// treated as absent for matching purposes, and are opportunistically
+    /// pruned from the map while the lock is held. This is defense-in-depth
+    /// on top of the explicit `unregister` calls, not a substitute for them.
     pub fn get(
         &self,
         name: &str,
     ) -> std::result::Result<(Arc<RefCell<IndexState>>, VectorTableConfig), String> {
-        let map = self.0.lock().unwrap();
+        let mut map = self.0.lock().unwrap();
 
         if name.contains('.') {
-            let e = map
-                .get(name)
-                .ok_or_else(|| format!("no vector table named {name}"))?;
-            let state = e
-                .state
-                .upgrade()
-                .ok_or_else(|| format!("no vector table named {name}"))?;
-            return Ok((state, e.config.clone()));
+            let live = match map.get(name) {
+                Some(e) => e.state.upgrade().map(|state| (state, e.config.clone())),
+                None => None,
+            };
+            return match live {
+                Some(pair) => Ok(pair),
+                None => {
+                    map.remove(name);
+                    Err(format!("no vector table named {name}"))
+                }
+            };
         }
 
         let suffix = format!(".{name}");
-        let mut matches: Vec<&RegistryEntry> = map
-            .iter()
-            .filter(|(k, _)| k.ends_with(&suffix))
-            .map(|(_, e)| e)
-            .collect();
+        let mut dead_keys: Vec<String> = Vec::new();
+        let mut matches: Vec<(Arc<RefCell<IndexState>>, VectorTableConfig)> = Vec::new();
+        for (k, e) in map.iter() {
+            if !k.ends_with(&suffix) {
+                continue;
+            }
+            match e.state.upgrade() {
+                Some(state) => matches.push((state, e.config.clone())),
+                None => dead_keys.push(k.clone()),
+            }
+        }
+        for k in dead_keys {
+            map.remove(&k);
+        }
 
         match matches.len() {
             0 => Err(format!("no vector table named {name}")),
-            1 => {
-                let e = matches.remove(0);
-                let state = e
-                    .state
-                    .upgrade()
-                    .ok_or_else(|| format!("no vector table named {name}"))?;
-                Ok((state, e.config.clone()))
-            }
+            1 => Ok(matches.remove(0)),
             _ => Err(format!("ambiguous table name '{name}'; qualify as 'db.{name}'")),
         }
     }
@@ -417,6 +444,7 @@ fn build_vtab<'vtab>(
         state,
         db: db as *const VTabConnection,
         functions,
+        registry: aux.clone(),
     };
 
     Ok((schema, vtab))
@@ -600,6 +628,16 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
             state: Arc::clone(&self.state),
         })
     }
+
+    fn disconnect(self) -> DisconnectResult<Self> {
+        // Mirror of connect()/build_vtab's `aux.register(...)`: this is the
+        // normal (non-DROP) teardown path — closing the connection, or
+        // SQLite reloading the schema — and must remove the same registry
+        // entry so it doesn't linger as a dead Weak (see Finding 1).
+        self.registry
+            .unregister(&self.config.db_name, &self.config.table_name);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +674,8 @@ impl<'vtab> CreateVTab<'vtab> for VectorTable<'vtab> {
                 return Err((self, e));
             }
         }
+        self.registry
+            .unregister(&self.config.db_name, &self.config.table_name);
         Ok(())
     }
 }
