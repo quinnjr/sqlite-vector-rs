@@ -120,7 +120,7 @@ fn autocommit_inserts_within_3x_of_single_transaction() {
     conn.execute_batch("CREATE VIRTUAL TABLE a USING vector(dim=8, type=float4, metric=l2);")
         .unwrap();
     let t0 = Instant::now();
-    for _ in 0..1000 {
+    for _ in 0..2000 {
         conn.execute("INSERT INTO a(vector) VALUES (vector_from_json(?1, 'float4'))", [json])
             .unwrap();
     }
@@ -132,7 +132,7 @@ fn autocommit_inserts_within_3x_of_single_transaction() {
         .unwrap();
     let t1 = Instant::now();
     conn2.execute_batch("BEGIN").unwrap();
-    for _ in 0..1000 {
+    for _ in 0..2000 {
         conn2
             .execute("INSERT INTO b(vector) VALUES (vector_from_json(?1, 'float4'))", [json])
             .unwrap();
