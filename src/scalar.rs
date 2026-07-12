@@ -375,6 +375,35 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
                     )));
                 }
 
+                {
+                    let s = state.borrow();
+                    if s.index.is_none() {
+                        return Err(Error::Module(format!(
+                            "table '{}' uses mode=exact and has no index",
+                            table_name
+                        )));
+                    }
+                }
+
+                // Read-modify-write the persisted meta BEFORE mutating the
+                // live index, so a failure here leaves the live index and
+                // persisted meta consistent (both unchanged) rather than
+                // diverging.
+                let db = ctx.db();
+                let meta_json = db.query_row(
+                    &ShadowOps::select_index_sql(&config.table_name),
+                    ["meta"],
+                    |row| Ok(row[0].get_str()?.to_owned()),
+                )?;
+                let mut meta: serde_json::Value =
+                    serde_json::from_str(&meta_json).map_err(|e| Error::Module(e.to_string()))?;
+                meta["ef_search"] = serde_json::json!(n);
+                db.insert(&ShadowOps::upsert_index_sql(&config.table_name), |stmt: &mut query::Statement| {
+                    "meta".bind_param(&mut *stmt, 1)?;
+                    meta.to_string().as_str().bind_param(&mut *stmt, 2)?;
+                    Ok(())
+                })?;
+
                 let s = state.borrow();
                 let idx = s.index.as_ref().ok_or_else(|| {
                     Error::Module(format!("table '{}' uses mode=exact and has no index", table_name))
@@ -382,21 +411,6 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
                 idx.set_ef_search(n as usize);
                 drop(s);
 
-                // Patch the persisted meta so reconnects keep the new value.
-                let db = ctx.db();
-                let meta_json = db.query_row(
-                    &ShadowOps::select_index_sql(&table_name),
-                    ["meta"],
-                    |row| Ok(row[0].get_str()?.to_owned()),
-                )?;
-                let mut meta: serde_json::Value =
-                    serde_json::from_str(&meta_json).map_err(|e| Error::Module(e.to_string()))?;
-                meta["ef_search"] = serde_json::json!(n);
-                db.insert(&ShadowOps::upsert_index_sql(&table_name), |stmt: &mut query::Statement| {
-                    "meta".bind_param(&mut *stmt, 1)?;
-                    meta.to_string().as_str().bind_param(&mut *stmt, 2)?;
-                    Ok(())
-                })?;
                 ctx.set_result(n)?;
                 Ok(())
             },
@@ -427,7 +441,7 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
                     Some(idx) => (idx.len() as i64, idx.ef_search() as i64),
                     None => {
                         let n: i64 = ctx.db().query_row(
-                            &format!("SELECT count(*) FROM \"{table_name}_data\""),
+                            &format!("SELECT count(*) FROM \"{}_data\"", config.table_name),
                             (),
                             |row| Ok(row[0].get_i64()),
                         )?;

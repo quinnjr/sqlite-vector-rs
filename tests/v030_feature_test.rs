@@ -300,6 +300,49 @@ fn duplicate_metadata_constraints_do_not_crash_best_index() {
 }
 
 #[test]
+fn vector_ef_search_and_index_info_accept_qualified_table_names() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE qn USING vector(dim=4, type=float4, metric=cosine, m=8, ef_search=32);
+         INSERT INTO qn(vector) VALUES (vector_from_json('[1.0, 0.0, 0.0, 0.0]', 'float4'));",
+    )
+    .unwrap();
+
+    // Bare name baseline.
+    let info_bare: String = conn
+        .query_row("SELECT vector_index_info('qn')", [], |r| r.get(0))
+        .unwrap();
+    let v_bare: serde_json::Value = serde_json::from_str(&info_bare).unwrap();
+
+    // "main.qn"-qualified calls must succeed and match the bare-name results,
+    // and must not build shadow-table SQL from the raw "main.qn" argument
+    // (which would look for a nonexistent "main.qn_index"/"main.qn_data" table).
+    let info_qualified: String = conn
+        .query_row("SELECT vector_index_info('main.qn')", [], |r| r.get(0))
+        .unwrap();
+    let v_qualified: serde_json::Value = serde_json::from_str(&info_qualified).unwrap();
+    assert_eq!(v_qualified, v_bare);
+
+    let new_ef: i64 = conn
+        .query_row("SELECT vector_ef_search('main.qn', 128)", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(new_ef, 128);
+
+    let info_after: String = conn
+        .query_row("SELECT vector_index_info('main.qn')", [], |r| r.get(0))
+        .unwrap();
+    let v_after: serde_json::Value = serde_json::from_str(&info_after).unwrap();
+    assert_eq!(v_after["ef_search"], 128);
+
+    // Bare-name view must observe the same update (same registry entry).
+    let info_bare_after: String = conn
+        .query_row("SELECT vector_index_info('qn')", [], |r| r.get(0))
+        .unwrap();
+    let v_bare_after: serde_json::Value = serde_json::from_str(&info_bare_after).unwrap();
+    assert_eq!(v_bare_after["ef_search"], 128);
+}
+
+#[test]
 fn index_info_reports_state_and_ef_search_is_adjustable() {
     let conn = open_with_extension();
     conn.execute_batch(
