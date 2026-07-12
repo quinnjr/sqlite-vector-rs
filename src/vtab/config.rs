@@ -15,6 +15,31 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Whether a table is served by an in-memory HNSW index or by a streaming
+/// brute-force exact scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMode {
+    Hnsw,
+    Exact,
+}
+
+impl IndexMode {
+    pub fn from_name(name: &str) -> Result<Self, ConfigError> {
+        match name {
+            "hnsw" => Ok(Self::Hnsw),
+            "exact" => Ok(Self::Exact),
+            other => Err(ConfigError(format!("unknown mode: {other}"))),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Hnsw => "hnsw",
+            Self::Exact => "exact",
+        }
+    }
+}
+
 /// Parsed configuration from CREATE VIRTUAL TABLE arguments.
 #[derive(Debug, Clone)]
 pub struct VectorTableConfig {
@@ -26,6 +51,7 @@ pub struct VectorTableConfig {
     pub hnsw_params: HnswParams,
     pub metadata_columns: Vec<(String, String)>,
     pub sync_every: u64,
+    pub mode: IndexMode,
 }
 
 impl VectorTableConfig {
@@ -45,6 +71,7 @@ impl VectorTableConfig {
         let mut hnsw_params = HnswParams::default();
         let mut metadata_columns = Vec::new();
         let mut sync_every: u64 = 1024;
+        let mut mode = IndexMode::Hnsw;
 
         for &arg in &args[3..] {
             let (key, value) = arg
@@ -97,6 +124,9 @@ impl VectorTableConfig {
                     }
                     sync_every = n;
                 }
+                "mode" => {
+                    mode = IndexMode::from_name(value)?;
+                }
                 other => {
                     return Err(ConfigError(format!("unknown parameter: {other}")));
                 }
@@ -114,6 +144,7 @@ impl VectorTableConfig {
             hnsw_params,
             metadata_columns,
             sync_every,
+            mode,
         })
     }
 
@@ -126,6 +157,7 @@ impl VectorTableConfig {
             "ef_construction": self.hnsw_params.ef_construction,
             "ef_search": self.hnsw_params.ef_search,
             "sync_every": self.sync_every,
+            "mode": self.mode.name(),
         })
         .to_string()
     }

@@ -11,7 +11,8 @@ use crate::vtab::config::VectorTableConfig;
 use crate::vtab::shadow::ShadowOps;
 
 pub struct IndexState {
-    pub index: HnswIndex,
+    /// `None` iff the table uses `mode=exact` (no HNSW index at all).
+    pub index: Option<HnswIndex>,
     pub dirty: bool,
     pub last_committed: Option<Vec<u8>>,
     pub changes_since_persist: u64,
@@ -39,8 +40,11 @@ unsafe impl Sync for VectorTransaction {}
 /// in sqlite3_ext 0.2).
 pub fn persist_index(db: &Connection, table_name: &str, s: &mut IndexState) -> Result<()> {
     use sqlite3_ext::query::Statement;
-    let buf = s
-        .index
+    let Some(index) = &s.index else {
+        // Exact mode: no HNSW graph to persist.
+        return Ok(());
+    };
+    let buf = index
         .save_to_buffer()
         .map_err(|e| Error::Module(e.to_string()))?;
     let sql = ShadowOps::upsert_index_sql(table_name);
@@ -86,6 +90,10 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
     }
 
     fn rollback(self) -> Result<()> {
+        if self.state.borrow().index.is_none() {
+            // Exact mode: no HNSW graph to roll back.
+            return Ok(());
+        }
         let db = unsafe { &*self.db };
         {
             let mut s = self.state.borrow_mut();
@@ -94,6 +102,8 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
                 .clone()
                 .expect("last_committed primed at connect/create");
             s.index
+                .as_ref()
+                .expect("checked above")
                 .load_from_buffer(&buf)
                 .map_err(|e| Error::Module(e.to_string()))?;
             s.dirty = false;
@@ -125,10 +135,13 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
             Some(self.config.hnsw_params),
         )
         .map_err(|e| Error::Module(e.to_string()))?;
-        let index = std::mem::replace(&mut s.index, placeholder);
+        let index = s
+            .index
+            .replace(placeholder)
+            .expect("checked Some at top of rollback");
         match crate::vtab::reconcile_index(db, &self.config, index) {
             Ok(reconciled) => {
-                s.index = reconciled;
+                s.index = Some(reconciled);
                 Ok(())
             }
             Err(e) => {
@@ -142,6 +155,8 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
                     .clone()
                     .expect("last_committed primed at connect/create");
                 s.index
+                    .as_ref()
+                    .expect("checked Some at top of rollback")
                     .load_from_buffer(&buf)
                     .map_err(|load_err| Error::Module(load_err.to_string()))?;
                 Err(e)
@@ -150,12 +165,15 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
     }
 
     fn savepoint(&mut self, n: i32) -> Result<()> {
-        let buf = self
-            .state
-            .borrow()
-            .index
+        let s = self.state.borrow();
+        let Some(index) = &s.index else {
+            // Exact mode: no HNSW graph to snapshot.
+            return Ok(());
+        };
+        let buf = index
             .save_to_buffer()
             .map_err(|e| Error::Module(e.to_string()))?;
+        drop(s);
         self.snapshots.push((n, buf));
         Ok(())
     }
@@ -167,13 +185,17 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
 
     fn rollback_to(&mut self, n: i32) -> Result<()> {
         let s = self.state.borrow_mut();
+        let Some(idx_ref) = &s.index else {
+            // Exact mode: no HNSW graph to roll back.
+            return Ok(());
+        };
         if let Some(idx) = self.snapshots.iter().position(|(sp, _)| *sp >= n) {
-            s.index
+            idx_ref
                 .load_from_buffer(&self.snapshots[idx].1)
                 .map_err(|e| Error::Module(e.to_string()))?;
             self.snapshots.truncate(idx + 1);
         } else if let Some(ref buf) = s.last_committed.clone() {
-            s.index
+            idx_ref
                 .load_from_buffer(buf)
                 .map_err(|e| Error::Module(e.to_string()))?;
         }

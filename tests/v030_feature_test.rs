@@ -198,3 +198,67 @@ fn knn_limit_zero_returns_no_rows() {
         .unwrap();
     assert_eq!(n, 0, "LIMIT 0 must return no rows");
 }
+
+#[test]
+fn exact_mode_knn_matches_hnsw_results() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE eh USING vector(dim=2, type=float4, metric=l2);
+         CREATE VIRTUAL TABLE ee USING vector(dim=2, type=float4, metric=l2, mode=exact);",
+    )
+    .unwrap();
+    // Coordinates are chosen (i % 13, (i * 3) % 17) rather than the more
+    // obvious (i % 7, i % 5) because the latter produces several points
+    // exactly equidistant from the query at the LIMIT-5 boundary: squared L2
+    // ties there are broken differently by usearch's graph traversal
+    // (HNSW, approximate order) versus a plain distance sort (exact, stable
+    // scan order), which made the two tables legitimately disagree on which
+    // members of a tied group made the cut — not a bug in either search
+    // path, just an underspecified expectation for tied inputs. This spread
+    // keeps the top candidates at distinct distances so the parity check is
+    // well-defined.
+    for i in 0..30 {
+        for t in ["eh", "ee"] {
+            conn.execute(
+                &format!("INSERT INTO {t}(vector) VALUES (vector_from_json(?1, 'float4'))"),
+                [format!("[{}.0, {}.0]", i % 13, (i * 3) % 17)],
+            )
+            .unwrap();
+        }
+    }
+    let q = "vector_from_json('[1.0, 9.0]', 'float4')";
+    let get = |t: &str| -> Vec<i64> {
+        conn.prepare(&format!(
+            "SELECT id FROM {t} WHERE knn_match(distance, {q}) LIMIT 5"
+        ))
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    };
+    assert_eq!(get("eh"), get("ee"), "exact and hnsw must agree on this small table");
+}
+
+#[test]
+fn exact_mode_respects_filters_and_limit() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ef USING vector(dim=2, type=float4, metric=l2, mode=exact, metadata=\"label TEXT\");
+         INSERT INTO ef(vector, label) VALUES (vector_from_json('[0.0, 0.0]', 'float4'), 'b');
+         INSERT INTO ef(vector, label) VALUES (vector_from_json('[1.0, 1.0]', 'float4'), 'a');
+         INSERT INTO ef(vector, label) VALUES (vector_from_json('[2.0, 2.0]', 'float4'), 'a');",
+    )
+    .unwrap();
+    let ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM ef WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4'))
+             AND label = 'a' LIMIT 2",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![2, 3]);
+}

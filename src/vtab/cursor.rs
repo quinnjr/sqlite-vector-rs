@@ -8,7 +8,7 @@ use sqlite3_ext::{
 };
 
 use crate::vtab::TableSql;
-use crate::vtab::config::VectorTableConfig;
+use crate::vtab::config::{IndexMode, VectorTableConfig};
 use crate::vtab::transaction::IndexState;
 
 // Index number must match INDEX_KNN in mod.rs
@@ -155,9 +155,91 @@ impl VTabCursor for VectorCursor {
                     self.mode = CursorMode::Knn { results: Vec::new(), pos: 0 };
                     return Ok(());
                 }
+
+                if config.mode == IndexMode::Exact {
+                    // Brute-force streaming top-k with pushed filters applied in SQL.
+                    let mut scan_sql = format!("{} WHERE 1=1", sql.scan_all);
+                    for (col, op) in &filters {
+                        let name = &config.metadata_columns[col - 2].0;
+                        let sql_op = match *op {
+                            "eq" => "=",
+                            "gt" => ">",
+                            "ge" => ">=",
+                            "lt" => "<",
+                            "le" => "<=",
+                            _ => unreachable!("index_str built by best_index"),
+                        };
+                        scan_sql.push_str(&format!(" AND {name} {sql_op} ?"));
+                    }
+                    let mut stmt = db.prepare(&scan_sql)?;
+                    stmt.query(|q: &mut sqlite3_ext::query::Statement| {
+                        for (i, arg) in filter_args.iter_mut().enumerate() {
+                            let vref: &ValueRef = arg;
+                            vref.bind_param(q, (i + 1) as i32)?;
+                        }
+                        Ok(())
+                    })?;
+
+                    // Max-heap of size k ordered by distance (f64::total_cmp), so
+                    // the worst-of-the-best-k-so-far is always at the top and can
+                    // be evicted in O(log k) as better candidates stream in.
+                    struct Hit(f64, ScanRow);
+                    impl PartialEq for Hit {
+                        fn eq(&self, o: &Self) -> bool {
+                            self.0 == o.0
+                        }
+                    }
+                    impl Eq for Hit {}
+                    impl PartialOrd for Hit {
+                        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                            Some(self.cmp(o))
+                        }
+                    }
+                    impl Ord for Hit {
+                        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                            self.0.total_cmp(&o.0)
+                        }
+                    }
+
+                    let mut heap: std::collections::BinaryHeap<Hit> =
+                        std::collections::BinaryHeap::with_capacity(target_k + 1);
+                    while let Some(row) = stmt.next()? {
+                        let r = read_scan_row(row, num_meta)?;
+                        let d = crate::distance::compute_distance(
+                            &query_blob,
+                            &r.vector,
+                            config.vtype,
+                            config.metric,
+                            config.dim,
+                        )
+                        .map_err(|e| Error::Module(e.to_string()))?;
+                        heap.push(Hit(d, r));
+                        if heap.len() > target_k {
+                            heap.pop();
+                        }
+                    }
+                    let mut rows: Vec<Hit> = heap.into_vec();
+                    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let results = rows
+                        .into_iter()
+                        .map(|Hit(d, r)| KnnRow {
+                            id: r.id,
+                            vector: r.vector,
+                            metadata: r.metadata,
+                            distance: d,
+                        })
+                        .collect();
+                    self.mode = CursorMode::Knn { results, pos: 0 };
+                    return Ok(());
+                }
+
                 let index_len = {
                     let state = self.state.borrow();
-                    state.index.len()
+                    state
+                        .index
+                        .as_ref()
+                        .expect("HNSW index present when mode != Exact")
+                        .len()
                 };
                 let mut kp = (4 * target_k).max(target_k + 16).min(index_len.max(1));
                 let mut results: Vec<KnnRow>;
@@ -167,6 +249,8 @@ impl VTabCursor for VectorCursor {
                         let state = self.state.borrow();
                         state
                             .index
+                            .as_ref()
+                            .expect("HNSW index present when mode != Exact")
                             .search(&query_blob, kp)
                             .map_err(|e| Error::Module(e.to_string()))?
                     };

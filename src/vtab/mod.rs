@@ -315,6 +315,18 @@ fn init(
                 config.table_name
             )));
         }
+        if let Some(mode_str) = meta["mode"].as_str() {
+            let persisted_mode = crate::vtab::config::IndexMode::from_name(mode_str)
+                .map_err(|e| Error::Module(e.to_string()))?;
+            if persisted_mode != config.mode {
+                return Err(Error::Module(format!(
+                    "declared mode disagrees with persisted meta for {}: expected {}, got {}",
+                    config.table_name,
+                    persisted_mode.name(),
+                    config.mode.name()
+                )));
+            }
+        }
         config.hnsw_params = params;
     }
 
@@ -336,40 +348,50 @@ fn build_vtab<'vtab>(
 ) -> Result<(String, VectorTable<'vtab>)> {
     let schema = config.vtab_schema();
 
-    // Try to reload a previously persisted index; fall back to a fresh one.
-    let index = match load_index_from_shadow(db, &config.table_name) {
-        Ok(Some(buf)) => {
-            let idx = HnswIndex::new(
+    let state = if config.mode == crate::vtab::config::IndexMode::Exact {
+        // Exact mode has no HNSW index to load/reconcile/snapshot.
+        Arc::new(RefCell::new(IndexState {
+            index: None,
+            dirty: false,
+            last_committed: None,
+            changes_since_persist: 0,
+        }))
+    } else {
+        // Try to reload a previously persisted index; fall back to a fresh one.
+        let index = match load_index_from_shadow(db, &config.table_name) {
+            Ok(Some(buf)) => {
+                let idx = HnswIndex::new(
+                    config.dim,
+                    config.vtype,
+                    config.metric,
+                    Some(config.hnsw_params),
+                )
+                .map_err(|e| Error::Module(e.to_string()))?;
+                idx.load_from_buffer(&buf)
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                idx
+            }
+            _ => HnswIndex::new(
                 config.dim,
                 config.vtype,
                 config.metric,
                 Some(config.hnsw_params),
             )
+            .map_err(|e| Error::Module(e.to_string()))?,
+        };
+
+        let index = reconcile_index(db, &config, index)?;
+
+        let snapshot = index
+            .save_to_buffer()
             .map_err(|e| Error::Module(e.to_string()))?;
-            idx.load_from_buffer(&buf)
-                .map_err(|e| Error::Module(e.to_string()))?;
-            idx
-        }
-        _ => HnswIndex::new(
-            config.dim,
-            config.vtype,
-            config.metric,
-            Some(config.hnsw_params),
-        )
-        .map_err(|e| Error::Module(e.to_string()))?,
+        Arc::new(RefCell::new(IndexState {
+            index: Some(index),
+            dirty: false,
+            last_committed: Some(snapshot),
+            changes_since_persist: 0,
+        }))
     };
-
-    let index = reconcile_index(db, &config, index)?;
-
-    let snapshot = index
-        .save_to_buffer()
-        .map_err(|e| Error::Module(e.to_string()))?;
-    let state = Arc::new(RefCell::new(IndexState {
-        index,
-        dirty: false,
-        last_committed: Some(snapshot),
-        changes_since_persist: 0,
-    }));
 
     aux.register(&state, &config);
 
@@ -607,15 +629,16 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
             ChangeType::Delete => {
                 let rowid = info.rowid().get_i64();
                 delete_from_data_shadow(db, &self.sql.delete, rowid)?;
-                self.state
-                    .borrow()
-                    .index
-                    .remove(rowid as u64)
-                    .map_err(|e| Error::Module(e.to_string()))?;
+                if let Some(idx) = &self.state.borrow().index {
+                    idx.remove(rowid as u64)
+                        .map_err(|e| Error::Module(e.to_string()))?;
+                }
                 {
                     let mut s = self.state.borrow_mut();
-                    s.dirty = true;
-                    s.changes_since_persist += 1;
+                    if s.index.is_some() {
+                        s.dirty = true;
+                        s.changes_since_persist += 1;
+                    }
                 }
                 Ok(0)
             }
@@ -657,15 +680,17 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                     insert_into_data_shadow(db, insert_sql, explicit_id, &vector_blob, meta_args)?;
 
                 let state = self.state.borrow();
-                state
-                    .index
-                    .add(rowid as u64, &vector_blob)
-                    .map_err(|e| Error::Module(e.to_string()))?;
+                if let Some(idx) = &state.index {
+                    idx.add(rowid as u64, &vector_blob)
+                        .map_err(|e| Error::Module(e.to_string()))?;
+                }
                 drop(state);
                 {
                     let mut s = self.state.borrow_mut();
-                    s.dirty = true;
-                    s.changes_since_persist += 1;
+                    if s.index.is_some() {
+                        s.dirty = true;
+                        s.changes_since_persist += 1;
+                    }
                 }
 
                 Ok(rowid)
@@ -725,7 +750,10 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 let include_id = !id_unchanged;
                 let include_vector = vector_blob.is_some();
                 let rowid_changed = new_rowid != old_rowid;
-                let needs_reindex = rowid_changed || include_vector;
+                // Exact mode has no in-memory index to re-key, so skip the
+                // reindex machinery (and the extra shadow read below) entirely.
+                let has_index = self.state.borrow().index.is_some();
+                let needs_reindex = has_index && (rowid_changed || include_vector);
 
                 // If we need to re-key the index but the vector itself isn't
                 // changing, fetch the existing vector BEFORE mutating the shadow
@@ -774,23 +802,23 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 }
 
                 if needs_reindex {
-                    let final_vector = vector_blob
-                        .or(reindex_vector)
-                        .expect("vector available for reindex: computed above");
                     let state = self.state.borrow();
-                    state
-                        .index
-                        .remove(old_rowid as u64)
-                        .map_err(|e| Error::Module(e.to_string()))?;
-                    state
-                        .index
-                        .add(new_rowid as u64, &final_vector)
-                        .map_err(|e| Error::Module(e.to_string()))?;
+                    if let Some(idx) = &state.index {
+                        let final_vector = vector_blob
+                            .or(reindex_vector)
+                            .expect("vector available for reindex: computed above");
+                        idx.remove(old_rowid as u64)
+                            .map_err(|e| Error::Module(e.to_string()))?;
+                        idx.add(new_rowid as u64, &final_vector)
+                            .map_err(|e| Error::Module(e.to_string()))?;
+                    }
                     drop(state);
                     {
                         let mut s = self.state.borrow_mut();
-                        s.dirty = true;
-                        s.changes_since_persist += 1;
+                        if s.index.is_some() {
+                            s.dirty = true;
+                            s.changes_since_persist += 1;
+                        }
                     }
                 }
 

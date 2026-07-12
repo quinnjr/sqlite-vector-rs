@@ -136,6 +136,11 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
             )?;
             let meta: serde_json::Value =
                 serde_json::from_str(&meta_json).map_err(|e| Error::Module(e.to_string()))?;
+            if meta["mode"].as_str() == Some("exact") {
+                return Err(Error::Module(format!(
+                    "table '{table_name}' uses mode=exact and has no index"
+                )));
+            }
             let (dim, vtype, metric, params) =
                 crate::vtab::config::VectorTableConfig::params_from_meta(&meta)
                     .map_err(|e| Error::Module(e.to_string()))?;
@@ -294,6 +299,13 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
                     return Err(Error::Module(format!(
                         "vector_sync_index is not supported for tables in attached database '{}' yet; only 'main' is supported",
                         config.db_name
+                    )));
+                }
+
+                if config.mode == crate::vtab::config::IndexMode::Exact {
+                    return Err(Error::Module(format!(
+                        "table '{}' uses mode=exact and has no index",
+                        config.table_name
                     )));
                 }
 
