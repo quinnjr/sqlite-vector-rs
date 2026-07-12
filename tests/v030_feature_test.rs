@@ -110,3 +110,38 @@ fn full_scan_streams_all_rows_in_order() {
     assert_eq!(ids.first(), Some(&1));
     assert_eq!(ids.last(), Some(&200));
 }
+
+#[test]
+fn autocommit_inserts_within_3x_of_single_transaction() {
+    use std::time::Instant;
+    let json = "[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]";
+
+    let conn = open_with_extension();
+    conn.execute_batch("CREATE VIRTUAL TABLE a USING vector(dim=8, type=float4, metric=l2);")
+        .unwrap();
+    let t0 = Instant::now();
+    for _ in 0..1000 {
+        conn.execute("INSERT INTO a(vector) VALUES (vector_from_json(?1, 'float4'))", [json])
+            .unwrap();
+    }
+    let auto = t0.elapsed();
+
+    let conn2 = open_with_extension();
+    conn2
+        .execute_batch("CREATE VIRTUAL TABLE b USING vector(dim=8, type=float4, metric=l2);")
+        .unwrap();
+    let t1 = Instant::now();
+    conn2.execute_batch("BEGIN").unwrap();
+    for _ in 0..1000 {
+        conn2
+            .execute("INSERT INTO b(vector) VALUES (vector_from_json(?1, 'float4'))", [json])
+            .unwrap();
+    }
+    conn2.execute_batch("COMMIT").unwrap();
+    let txn = t1.elapsed();
+
+    assert!(
+        auto < txn * 3 + std::time::Duration::from_millis(200),
+        "autocommit {auto:?} must stay within 3x of one-txn {txn:?} (+200ms slack)"
+    );
+}
