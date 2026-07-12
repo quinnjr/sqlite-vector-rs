@@ -12,8 +12,12 @@ lives in a shadow table and is persisted across connections.
 - **6 vector types** — `float2` (f16), `float4` (f32), `float8` (f64), `int1` (i8), `int2` (i16), `int4` (i32)
 - **3 distance metrics** — L2 (squared Euclidean), cosine, inner product
 - **HNSW approximate nearest-neighbor search** via usearch with configurable parameters
+- **Exact brute-force mode** (`mode=exact`) — streaming top-k with true distances, no index
+- **Filtered KNN** — metadata `=`/`<`/`<=`/`>`/`>=` predicates pushed into the search with oversampling
+- **Crash-safe lazy index persistence** — the graph persists every `sync_every` changes and reconciles against row data on connect
+- **Vector math functions** — normalize, add, sub, scale, slice, int8 quantization
 - **Arrow IPC bulk import/export** for efficient batch operations
-- **Full virtual table** with INSERT, UPDATE, DELETE, and transaction rollback
+- **Full virtual table** with INSERT, UPDATE, DELETE, and transaction/savepoint rollback
 - **Optional metadata columns** alongside vectors (TEXT, INTEGER, REAL, BLOB)
 - **Works three ways** — loadable SQLite extension, Rust library, or standalone CLI
 
@@ -84,7 +88,7 @@ cargo build --features library --bin sqlite3
 ```
 
 ```
-sqlite3-vector v0.1.0 (SQLite 3.49.1)
+sqlite3-vector v0.3.0 (SQLite 3.49.1)
 Enter ".help" for usage hints.
 sqlite3-vector> CREATE VIRTUAL TABLE docs USING vector(dim=3, type=float4, metric=cosine);
 sqlite3-vector> INSERT INTO docs(vector) VALUES (vector_from_json('[1,0,0]', 'float4'));
@@ -108,13 +112,25 @@ CREATE VIRTUAL TABLE <name> USING vector(
     m=<integer>,                 -- HNSW M parameter (default: 16)
     ef_construction=<integer>,   -- HNSW build quality (default: 128)
     ef_search=<integer>,         -- HNSW query quality (default: 64)
+    mode=<hnsw|exact>,           -- index mode (default: hnsw)
+    sync_every=<integer>,        -- rows between graph persists (default: 1024)
     metadata='col1 TYPE, ...'    -- optional metadata columns
 );
 ```
 
 **Vector types:** `float2`, `float4`, `float8`, `int1`, `int2`, `int4`
 
-**Distance metrics:** `l2`, `cosine`, `inner_product`
+**Distance metrics:** `l2`, `cosine`, `ip` (inner product)
+
+**Index modes:**
+- `hnsw` (default) — approximate nearest-neighbor search via a usearch HNSW
+  graph, tunable with `m` / `ef_construction` / `ef_search`.
+- `exact` — brute-force streaming top-k over the shadow data table. Computes
+  true distances with no graph/index machinery at all; useful for small
+  tables, ground-truth comparisons, or when approximate recall isn't
+  acceptable. `vector_rebuild_index`, `vector_sync_index`, and
+  `vector_ef_search` all reject `mode=exact` tables since there is no index
+  to rebuild, sync, or tune.
 
 ### KNN Search
 
@@ -126,8 +142,17 @@ LIMIT <k>;
 ```
 
 The `distance` column is a hidden virtual column that returns the distance
-between each stored vector and the query. `knn_match` activates the HNSW index
-for efficient approximate search.
+between each stored vector and the query. `knn_match` activates the index
+(HNSW or exact, depending on the table's `mode`) for the search.
+
+- If `LIMIT` is omitted, `k` defaults to 100 rows.
+- `ORDER BY distance` ascending is served directly by the index/exact scan;
+  `ORDER BY distance DESC` (or any other ordering) falls back to SQLite's own
+  sort over the returned rows.
+- Adding equality/range predicates on metadata columns (`=`, `<`, `<=`, `>`,
+  `>=`) is pushed down as a filter: the index is searched with oversampling
+  (fetching more than `k` candidates and filtering) until `k` rows satisfying
+  the predicate are found or the table is exhausted.
 
 ### Scalar Functions
 
@@ -137,9 +162,32 @@ for efficient approximate search.
 | `vector_to_json(blob, type)` | Convert a vector blob to a JSON array string |
 | `vector_distance(blob_a, blob_b, metric, type)` | Compute distance between two vectors |
 | `vector_dims(blob, type)` | Return the number of dimensions |
-| `vector_rebuild_index(table, type, metric)` | Rebuild the HNSW index from shadow data |
+| `vector_rebuild_index(table)` | Rebuild the HNSW index from shadow data, using the table's persisted config (`hnsw` tables only) |
+| `vector_sync_index(table)` | Force-persist the in-memory HNSW graph now, regardless of `sync_every` (`hnsw` tables only) |
+| `vector_ef_search(table, n)` | Change a live table's `ef_search` and persist it for future reconnects (`hnsw` tables only) |
+| `vector_index_info(table)` | Return a JSON object describing the table: `rows`, `dim`, `type`, `metric`, `mode`, `m`, `ef_construction`, `ef_search`, `sync_every`, `changes_since_persist` |
+| `vector_normalize(blob, type)` | L2-normalize a vector; errors on a zero vector |
+| `vector_add(blob_a, blob_b, type)` | Element-wise vector addition |
+| `vector_sub(blob_a, blob_b, type)` | Element-wise vector subtraction |
+| `vector_scale(blob, factor, type)` | Multiply every element by a scalar |
+| `vector_slice(blob, type, start, end)` | Extract a half-open element range `[start, end)` |
+| `vector_quantize_int8(blob, type)` | Quantize to `int1` using symmetric max-abs scaling |
 | `vector_export_arrow(table, type)` | Export all vectors as an Arrow IPC blob |
 | `vector_insert_arrow(table, type, ipc_blob)` | Import vectors from an Arrow IPC blob |
+
+`vector_sync_index`, `vector_ef_search`, and `vector_index_info` accept either
+a bare table name or a `db.table`-qualified name, but currently only tables in
+the `main` database are supported — calling them against a table in an
+attached database returns an error. See "Known limitations" below.
+
+Notes on the arithmetic/quantization functions:
+- `vector_add`/`vector_sub`/`vector_scale` on integer-typed vectors compute in
+  `f64` internally and cast back to the element type on output; results
+  saturate (clamp) at the type's min/max on overflow rather than wrapping or
+  erroring.
+- `vector_quantize_int8` scales by `127 / max(|v|)` (symmetric, based on the
+  vector's own max absolute value) and rounds half-away-from-zero, clamping
+  to `[-127, 127]`.
 
 ### Metadata Columns
 
@@ -160,6 +208,41 @@ WHERE knn_match(distance, vector_from_json('[...]', 'float4'))
 LIMIT 5;
 ```
 
+SQLite splits unquoted `CREATE VIRTUAL TABLE` module arguments on commas, so a
+multi-column `metadata` value **must** be quoted as a single argument (as
+shown above: `metadata='title TEXT, source TEXT, page INTEGER'`). Passing it
+unquoted (`metadata=title TEXT, source TEXT, page INTEGER`) would be parsed
+as several separate, invalid module arguments.
+
+### Durability & Concurrency
+
+- The `_data` shadow table (rowid, vector, metadata) is the transactional
+  source of truth — every INSERT/UPDATE/DELETE goes through normal SQLite
+  transactions, rollback, and savepoints.
+- The in-memory HNSW graph is **lazily** persisted to the `_index` shadow
+  table: it's written every `sync_every` changes (default 1024), not on every
+  write. Call `vector_sync_index(table)` to force a persist immediately (e.g.
+  before a backup).
+- On connect, the table reconciles the persisted graph against `_data`: rows
+  that were added/removed since the last persist are patched into the graph.
+  This makes the setup crash-safe — a crash between graph persists loses at
+  most the not-yet-persisted graph state, never row data — at the cost of a
+  reconcile pass at open time.
+- One writer per table at a time is assumed. Concurrent writers are
+  last-write-wins **on the graph blob only** (never on `_data` rows, which
+  remain fully transactional); other connections observe index changes only
+  after they reconnect (or the table is re-opened), not live.
+
+### Known Limitations
+
+- `int2`/`int4` vectors are indexed as `f32` internally, which is lossy for
+  integer magnitudes above 2^24.
+- `vector_sync_index`, `vector_ef_search`, and `vector_index_info` only
+  support tables in the `main` database. Vector tables in attached databases
+  currently share `main`'s shadow-table namespace for these operations, so
+  calling them against an attached-database table is rejected outright rather
+  than risk writing into the wrong (or nonexistent) shadow tables.
+
 ### Arrow IPC Bulk Operations
 
 Export all vectors to an Arrow IPC stream, then re-import into another table:
@@ -172,7 +255,7 @@ SELECT vector_export_arrow('source_table', 'float4');
 SELECT vector_insert_arrow('dest_table', 'float4', <ipc_blob>);
 
 -- Rebuild the HNSW index after bulk import
-SELECT vector_rebuild_index('dest_table', 'float4', 'cosine');
+SELECT vector_rebuild_index('dest_table');
 ```
 
 ## Architecture
@@ -225,8 +308,8 @@ SELECT vector_rebuild_index('dest_table', 'float4', 'cosine');
 # Build the extension first (required for integration tests)
 cargo build
 
-# Run all 271 tests
-cargo test
+# Run all 324 tests
+cargo test --features library
 ```
 
 The test suite includes unit tests for every module, integration tests for
