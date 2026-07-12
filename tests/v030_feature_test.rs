@@ -289,3 +289,81 @@ fn index_info_reports_state_and_ef_search_is_adjustable() {
     let v2: serde_json::Value = serde_json::from_str(&info2).unwrap();
     assert_eq!(v2["ef_search"], 128);
 }
+
+#[test]
+fn vector_utility_functions() {
+    let conn = open_with_extension();
+    // normalize: [3,4] -> [0.6, 0.8]
+    let n: String = conn
+        .query_row(
+            "SELECT vector_to_json(vector_normalize(vector_from_json('[3.0, 4.0]', 'float4'), 'float4'), 'float4')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let v: Vec<f64> = serde_json::from_str(&n).unwrap();
+    assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+
+    // add / sub / scale
+    let s: String = conn
+        .query_row(
+            "SELECT vector_to_json(vector_add(vector_from_json('[1.0, 2.0]', 'float4'), vector_from_json('[3.0, 4.0]', 'float4'), 'float4'), 'float4')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Vec<f64>>(&s).unwrap(), vec![4.0, 6.0]);
+
+    let d: String = conn
+        .query_row(
+            "SELECT vector_to_json(vector_scale(vector_from_json('[1.0, -2.0]', 'float4'), 2.5, 'float4'), 'float4')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Vec<f64>>(&d).unwrap(), vec![2.5, -5.0]);
+
+    // slice: elements [1, 3) of a 4-dim vector
+    let sl: String = conn
+        .query_row(
+            "SELECT vector_to_json(vector_slice(vector_from_json('[0.0, 1.0, 2.0, 3.0]', 'float4'), 'float4', 1, 3), 'float4')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Vec<f64>>(&sl).unwrap(), vec![1.0, 2.0]);
+
+    // quantize: [0.0, 127-max scaling] — max_abs=2.0 -> scale 63.5
+    // Note: -1.0 * 63.5 = -63.5, which rounds to -64 (round-half-away-from-zero)
+    let q: String = conn
+        .query_row(
+            "SELECT vector_to_json(vector_quantize_int8(vector_from_json('[2.0, -1.0]', 'float4'), 'float4'), 'int1')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Vec<i64>>(&q).unwrap(), vec![127, -64]);
+
+    // error cases
+    assert!(conn
+        .query_row(
+            "SELECT vector_add(vector_from_json('[1.0]', 'float4'), vector_from_json('[1.0, 2.0]', 'float4'), 'float4')",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .is_err(), "dimension mismatch must error");
+    assert!(conn
+        .query_row(
+            "SELECT vector_normalize(vector_from_json('[0.0, 0.0]', 'float4'), 'float4')",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .is_err(), "zero vector cannot be normalized");
+    assert!(conn
+        .query_row(
+            "SELECT vector_slice(vector_from_json('[1.0, 2.0]', 'float4'), 'float4', 1, 5)",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .is_err(), "out-of-bounds slice must error");
+}

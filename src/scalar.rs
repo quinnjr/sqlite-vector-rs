@@ -11,6 +11,41 @@ use crate::vtab::Registry;
 use crate::vtab::shadow::ShadowOps;
 use crate::vtab::transaction::persist_index;
 
+/// Helper: decode blob to f64 values for any vector type
+fn blob_to_f64s(blob: &[u8], vtype: VectorType) -> Vec<f64> {
+    use crate::types::cast_blob;
+    match vtype {
+        VectorType::Float2 => cast_blob::<half::f16>(blob).iter().map(|v| v.to_f64()).collect(),
+        VectorType::Float4 => cast_blob::<f32>(blob).iter().map(|v| *v as f64).collect(),
+        VectorType::Float8 => cast_blob::<f64>(blob).to_vec(),
+        VectorType::Int1 => cast_blob::<i8>(blob).iter().map(|v| *v as f64).collect(),
+        VectorType::Int2 => cast_blob::<i16>(blob).iter().map(|v| *v as f64).collect(),
+        VectorType::Int4 => cast_blob::<i32>(blob).iter().map(|v| *v as f64).collect(),
+    }
+}
+
+/// Helper: encode f64 values back to blob for any vector type
+fn f64s_to_blob(values: &[f64], vtype: VectorType) -> Vec<u8> {
+    match vtype {
+        VectorType::Float2 => vtype.slice_to_blob(
+            &values.iter().map(|v| half::f16::from_f64(*v)).collect::<Vec<_>>(),
+        ),
+        VectorType::Float4 => vtype.slice_to_blob(
+            &values.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+        ),
+        VectorType::Float8 => vtype.slice_to_blob(values),
+        VectorType::Int1 => vtype.slice_to_blob(
+            &values.iter().map(|v| *v as i8).collect::<Vec<_>>(),
+        ),
+        VectorType::Int2 => vtype.slice_to_blob(
+            &values.iter().map(|v| *v as i16).collect::<Vec<_>>(),
+        ),
+        VectorType::Int4 => vtype.slice_to_blob(
+            &values.iter().map(|v| *v as i32).collect::<Vec<_>>(),
+        ),
+    }
+}
+
 /// Register all standalone scalar functions on a connection.
 pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<()> {
     // vector_distance(blob_a, blob_b, metric, type) -> REAL
@@ -416,6 +451,125 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
             },
         )?;
     }
+
+    // vector_normalize(blob, type) -> BLOB (float4 output for int inputs)
+    db.create_scalar_function(
+        "vector_normalize",
+        &FunctionOptions::default().set_n_args(2).set_deterministic(true),
+        |ctx, args| {
+            let type_name = args[1].get_str()?.to_owned();
+            let blob = args[0].get_blob()?.to_vec();
+            let vtype = VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
+            let vals = blob_to_f64s(&blob, vtype);
+            let norm = vals.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if norm == 0.0 {
+                return Err(Error::Module("cannot normalize a zero vector".into()));
+            }
+            let out: Vec<f64> = vals.iter().map(|v| v / norm).collect();
+            let out_type = if vtype.is_float() { vtype } else { VectorType::Float4 };
+            ctx.set_result(&f64s_to_blob(&out, out_type)[..])?;
+            Ok(())
+        },
+    )?;
+
+    // vector_add(a, b, type) -> BLOB
+    db.create_scalar_function(
+        "vector_add",
+        &FunctionOptions::default().set_n_args(3).set_deterministic(true),
+        |ctx, args| {
+            let type_name = args[2].get_str()?.to_owned();
+            let a = args[0].get_blob()?.to_vec();
+            let b = args[1].get_blob()?.to_vec();
+            let vtype = VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
+            if a.len() != b.len() {
+                return Err(Error::Module("vector dimensions do not match".into()));
+            }
+            let va = blob_to_f64s(&a, vtype);
+            let vb = blob_to_f64s(&b, vtype);
+            let out: Vec<f64> = va.iter().zip(&vb).map(|(x, y)| x + y).collect();
+            ctx.set_result(&f64s_to_blob(&out, vtype)[..])?;
+            Ok(())
+        },
+    )?;
+
+    // vector_sub(a, b, type) -> BLOB
+    db.create_scalar_function(
+        "vector_sub",
+        &FunctionOptions::default().set_n_args(3).set_deterministic(true),
+        |ctx, args| {
+            let type_name = args[2].get_str()?.to_owned();
+            let a = args[0].get_blob()?.to_vec();
+            let b = args[1].get_blob()?.to_vec();
+            let vtype = VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
+            if a.len() != b.len() {
+                return Err(Error::Module("vector dimensions do not match".into()));
+            }
+            let va = blob_to_f64s(&a, vtype);
+            let vb = blob_to_f64s(&b, vtype);
+            let out: Vec<f64> = va.iter().zip(&vb).map(|(x, y)| x - y).collect();
+            ctx.set_result(&f64s_to_blob(&out, vtype)[..])?;
+            Ok(())
+        },
+    )?;
+
+    // vector_scale(blob, factor, type) -> BLOB
+    db.create_scalar_function(
+        "vector_scale",
+        &FunctionOptions::default().set_n_args(3).set_deterministic(true),
+        |ctx, args| {
+            let type_name = args[2].get_str()?.to_owned();
+            let factor = args[1].get_f64();
+            let blob = args[0].get_blob()?.to_vec();
+            let vtype = VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
+            let out: Vec<f64> = blob_to_f64s(&blob, vtype).iter().map(|v| v * factor).collect();
+            ctx.set_result(&f64s_to_blob(&out, vtype)[..])?;
+            Ok(())
+        },
+    )?;
+
+    // vector_slice(blob, type, start, end) -> BLOB (half-open element range)
+    db.create_scalar_function(
+        "vector_slice",
+        &FunctionOptions::default().set_n_args(4).set_deterministic(true),
+        |ctx, args| {
+            let type_name = args[1].get_str()?.to_owned();
+            let start = args[2].get_i64();
+            let end = args[3].get_i64();
+            let blob = args[0].get_blob()?.to_vec();
+            let vtype = VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
+            let dim = (blob.len() / vtype.element_size()) as i64;
+            if start < 0 || end < start || end > dim {
+                return Err(Error::Module(format!(
+                    "slice [{start}, {end}) out of bounds for dimension {dim}"
+                )));
+            }
+            let es = vtype.element_size();
+            let out = blob[start as usize * es..end as usize * es].to_vec();
+            ctx.set_result(&out[..])?;
+            Ok(())
+        },
+    )?;
+
+    // vector_quantize_int8(blob, type) -> BLOB (int1), symmetric max-abs scaling
+    db.create_scalar_function(
+        "vector_quantize_int8",
+        &FunctionOptions::default().set_n_args(2).set_deterministic(true),
+        |ctx, args| {
+            let type_name = args[1].get_str()?.to_owned();
+            let blob = args[0].get_blob()?.to_vec();
+            let vtype = VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
+            let vals = blob_to_f64s(&blob, vtype);
+            let max_abs = vals.iter().fold(0f64, |m, v| m.max(v.abs()));
+            let out: Vec<i8> = if max_abs == 0.0 {
+                vec![0; vals.len()]
+            } else {
+                let scale = 127.0 / max_abs;
+                vals.iter().map(|v| (v * scale).round().clamp(-127.0, 127.0) as i8).collect()
+            };
+            ctx.set_result(&VectorType::Int1.slice_to_blob(&out)[..])?;
+            Ok(())
+        },
+    )?;
 
     Ok(())
 }
