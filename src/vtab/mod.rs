@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
-use sqlite3_ext::query::ToParam;
+use sqlite3_ext::query::{Statement, ToParam};
 use sqlite3_ext::vtab::{
     ChangeInfo, ChangeType, ConstraintOp, CreateVTab, DisconnectResult, FindFunctionVTab,
     IndexInfo, TransactionVTab, UpdateVTab, VTab, VTabConnection, VTabFunctionList,
@@ -73,10 +73,31 @@ pub struct VectorTable<'vtab> {
     /// connect/create time. `disconnect()` doesn't receive `Aux`, so this is
     /// how it can remove its own entry (see Finding 1).
     registry: Registry,
+    /// Cached prepared statements for the `xUpdate` paths (spec 2.3): insert,
+    /// insert-with-explicit-id, delete-by-rowid, fetch-by-id. `Statement` is
+    /// an owned struct with no connection lifetime (see global-constraints),
+    /// and `Statement::query`/`execute`/`insert` reset the statement and
+    /// clear/rebind parameters on every call, so holding one across `update()`
+    /// invocations and reusing it is safe as long as it's never touched from
+    /// more than one call at a time — guaranteed by the same single-thread
+    /// invariant documented on the `unsafe impl Send/Sync` below. The dynamic
+    /// UPDATE SET path is intentionally excluded: its SQL text varies per
+    /// call (see `TableSql`'s doc comment), so there is nothing stable to
+    /// cache. The cursor's scan/KNN statements are out of scope here — it
+    /// only holds raw `*const` pointers, not owned state, so caching would
+    /// need a lifetime story of its own.
+    stmt_insert: RefCell<Option<Statement>>,
+    stmt_insert_with_id: RefCell<Option<Statement>>,
+    stmt_delete: RefCell<Option<Statement>>,
+    stmt_fetch_by_id: RefCell<Option<Statement>>,
 }
 
 // Safety: VectorTable is only ever accessed from a single thread by SQLite's
-// virtual table machinery.
+// virtual table machinery. This covers the raw `db` pointer as well as the
+// cached `Statement`s above (each wraps a live `sqlite3_stmt*`): all are
+// created and used exclusively under SQLite's one-thread-per-connection
+// guarantee, so no cross-thread aliasing of the underlying sqlite3_stmt can
+// occur.
 unsafe impl Send for VectorTable<'_> {}
 unsafe impl Sync for VectorTable<'_> {}
 
@@ -124,16 +145,32 @@ pub(crate) fn load_meta_from_shadow(
     }
 }
 
-/// Insert a new row into `_data` and return the auto-assigned rowid.
-fn insert_into_data_shadow(
+/// Fetch the cached `Statement` from `cell`, preparing it against `sql` the
+/// first time it's needed. Subsequent calls reuse the same prepared
+/// statement — `Statement::query`/`execute`/`insert` reset it and rebind
+/// parameters on every call (see the doc comment on `VectorTable`'s
+/// `stmt_*` fields), so this is safe to call repeatedly across `xUpdate`
+/// invocations.
+fn cached_stmt<'a>(
+    cell: &'a RefCell<Option<Statement>>,
     db: &VTabConnection,
     sql: &str,
+) -> Result<std::cell::RefMut<'a, Option<Statement>>> {
+    if cell.borrow().is_none() {
+        let stmt = db.prepare(sql)?;
+        *cell.borrow_mut() = Some(stmt);
+    }
+    Ok(cell.borrow_mut())
+}
+
+/// Insert a new row into `_data` and return the auto-assigned rowid.
+fn insert_into_data_shadow(
+    stmt: &mut Statement,
     explicit_id: Option<i64>,
     vector_blob: &[u8],
     metadata_args: &mut [&mut ValueRef],
 ) -> Result<i64> {
-    use sqlite3_ext::query::Statement;
-    db.insert(sql, |stmt: &mut Statement| {
+    stmt.insert(|stmt: &mut Statement| {
         let mut i = 1;
         if let Some(id) = explicit_id {
             id.bind_param(&mut *stmt, i)?;
@@ -150,19 +187,15 @@ fn insert_into_data_shadow(
 }
 
 /// Delete a row from `_data` by rowid.
-fn delete_from_data_shadow(db: &VTabConnection, sql: &str, rowid: i64) -> Result<()> {
-    db.execute(sql, [rowid])?;
+fn delete_from_data_shadow(stmt: &mut Statement, rowid: i64) -> Result<()> {
+    stmt.execute([rowid])?;
     Ok(())
 }
 
 /// Fetch a row from `_data` by rowid, returning (id, vector) or None if not found.
-fn fetch_row_from_shadow(
-    db: &VTabConnection,
-    sql: &str,
-    rowid: i64,
-) -> Result<Option<(i64, Vec<u8>)>> {
+fn fetch_row_from_shadow(stmt: &mut Statement, rowid: i64) -> Result<Option<(i64, Vec<u8>)>> {
     use sqlite3_ext::SQLITE_EMPTY;
-    match db.query_row(sql, [rowid], |row| {
+    match stmt.query_row([rowid], |row| {
         let id = row[0].get_i64();
         let vector = row[1].get_blob()?.to_vec();
         Ok((id, vector))
@@ -287,32 +320,38 @@ pub fn reconcile_index(
     db: &VTabConnection,
     config: &VectorTableConfig,
     index: HnswIndex,
+    ids_vectors_sql: &str,
 ) -> Result<HnswIndex> {
-    let sql = ShadowOps::select_ids_vectors_sql(&config.table_name);
-    let mut stmt = db.prepare(&sql)?;
+    let mut stmt = db.prepare(ids_vectors_sql)?;
     stmt.query(())?;
     let mut count: usize = 0;
+    // Accumulated during the single scan so the (rare) rebuild-from-scratch
+    // path below doesn't need to re-query `_data`. Memory is bounded by
+    // table size, but only on that rare path is it actually used — this is
+    // an acceptable trade for avoiding a second full scan on every connect.
+    let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
     while let Some(row) = stmt.next()? {
         count += 1;
-        let id = row[0].get_i64() as u64;
-        if !index.contains(id) {
+        let id = row[0].get_i64();
+        let vector = row[1].get_blob()?.to_vec();
+        if !index.contains(id as u64) {
             index
-                .add(id, row[1].get_blob()?)
+                .add(id as u64, &vector)
                 .map_err(|e| Error::Module(e.to_string()))?;
         }
+        rows.push((id, vector));
     }
     if index.len() == count {
         return Ok(index);
     }
     // Graph holds keys that no longer exist in _data (deletes lost since the
-    // last persist): rebuild from scratch.
+    // last persist): rebuild from scratch, reusing the rows collected above
+    // instead of re-querying `_data`.
     let fresh = HnswIndex::new(config.dim, config.vtype, config.metric, Some(config.hnsw_params))
         .map_err(|e| Error::Module(e.to_string()))?;
-    let mut stmt = db.prepare(&sql)?;
-    stmt.query(())?;
-    while let Some(row) = stmt.next()? {
+    for (id, vector) in &rows {
         fresh
-            .add(row[0].get_i64() as u64, row[1].get_blob()?)
+            .add(*id as u64, vector)
             .map_err(|e| Error::Module(e.to_string()))?;
     }
     Ok(fresh)
@@ -377,6 +416,9 @@ fn build_vtab<'vtab>(
     config: VectorTableConfig,
 ) -> Result<(String, VectorTable<'vtab>)> {
     let schema = config.vtab_schema();
+    // Built before reconcile so its `ids_vectors` SQL can be reused there
+    // instead of re-deriving the same string (see TableSql::ids_vectors).
+    let sql = TableSql::new(&config);
 
     let state = if config.mode == crate::vtab::config::IndexMode::Exact {
         // Exact mode has no HNSW index to load/reconcile/snapshot.
@@ -411,7 +453,7 @@ fn build_vtab<'vtab>(
             .map_err(|e| Error::Module(e.to_string()))?,
         };
 
-        let index = reconcile_index(db, &config, index)?;
+        let index = reconcile_index(db, &config, index, &sql.ids_vectors)?;
 
         let snapshot = index
             .save_to_buffer()
@@ -439,8 +481,6 @@ fn build_vtab<'vtab>(
         |ctx: &Context, _args: &mut [&mut ValueRef]| ctx.set_result(1i32),
     );
 
-    let sql = TableSql::new(&config);
-
     let vtab = VectorTable {
         config,
         sql,
@@ -448,6 +488,10 @@ fn build_vtab<'vtab>(
         db: db as *const VTabConnection,
         functions,
         registry: aux.clone(),
+        stmt_insert: RefCell::new(None),
+        stmt_insert_with_id: RefCell::new(None),
+        stmt_delete: RefCell::new(None),
+        stmt_fetch_by_id: RefCell::new(None),
     };
 
     Ok((schema, vtab))
@@ -695,7 +739,10 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
         match info.change_type() {
             ChangeType::Delete => {
                 let rowid = info.rowid().get_i64();
-                delete_from_data_shadow(db, &self.sql.delete, rowid)?;
+                {
+                    let mut stmt = cached_stmt(&self.stmt_delete, db, &self.sql.delete)?;
+                    delete_from_data_shadow(stmt.as_mut().unwrap(), rowid)?;
+                }
                 if let Some(idx) = &self.state.borrow().index {
                     idx.remove(rowid as u64)
                         .map_err(|e| Error::Module(e.to_string()))?;
@@ -743,13 +790,24 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                     .validate_finite(&vector_blob, self.config.dim)
                     .map_err(|e| Error::Module(e.to_string()))?;
 
-                let insert_sql = if explicit_id.is_some() {
-                    &self.sql.insert_with_id
+                let rowid = if explicit_id.is_some() {
+                    let mut stmt =
+                        cached_stmt(&self.stmt_insert_with_id, db, &self.sql.insert_with_id)?;
+                    insert_into_data_shadow(
+                        stmt.as_mut().unwrap(),
+                        explicit_id,
+                        &vector_blob,
+                        meta_args,
+                    )?
                 } else {
-                    &self.sql.insert
+                    let mut stmt = cached_stmt(&self.stmt_insert, db, &self.sql.insert)?;
+                    insert_into_data_shadow(
+                        stmt.as_mut().unwrap(),
+                        explicit_id,
+                        &vector_blob,
+                        meta_args,
+                    )?
                 };
-                let rowid =
-                    insert_into_data_shadow(db, insert_sql, explicit_id, &vector_blob, meta_args)?;
 
                 let state = self.state.borrow();
                 if let Some(idx) = &state.index {
@@ -832,7 +890,8 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 // row (once the row's id changes, it's no longer reachable at
                 // old_rowid).
                 let reindex_vector: Option<Vec<u8>> = if needs_reindex && vector_blob.is_none() {
-                    match fetch_row_from_shadow(db, &self.sql.fetch_by_id, old_rowid)? {
+                    let mut stmt = cached_stmt(&self.stmt_fetch_by_id, db, &self.sql.fetch_by_id)?;
+                    match fetch_row_from_shadow(stmt.as_mut().unwrap(), old_rowid)? {
                         Some((_, v)) => Some(v),
                         None => {
                             return Err(Error::Module(format!(
@@ -921,6 +980,7 @@ impl<'vtab> TransactionVTab<'vtab> for VectorTable<'vtab> {
             snapshots: Vec::new(),
             sync_every: self.config.sync_every,
             config: self.config.clone(),
+            ids_vectors_sql: self.sql.ids_vectors.clone(),
         })
     }
 }

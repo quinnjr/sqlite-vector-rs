@@ -114,14 +114,7 @@ impl VTabCursor for VectorCursor {
                 let spec = index_str.unwrap_or("knn;limit=0;f=");
                 let limit_taken = spec.contains("limit=1");
                 let filter_part = spec.rsplit("f=").next().unwrap_or("");
-                let filters: Vec<(usize, &str)> = filter_part
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        let (col, op) = s.split_once(':').expect("index_str built by best_index");
-                        (col.parse::<usize>().unwrap(), op)
-                    })
-                    .collect();
+                let filters = parse_index_str_filters(filter_part)?;
 
                 let mut next_arg = 1;
                 let k = if limit_taken {
@@ -136,18 +129,7 @@ impl VTabCursor for VectorCursor {
 
                 let num_meta = config.metadata_columns.len();
                 let mut fetch_sql = sql.fetch_by_id.clone();
-                for (col, op) in &filters {
-                    let name = &config.metadata_columns[col - 2].0;
-                    let sql_op = match *op {
-                        "eq" => "=",
-                        "gt" => ">",
-                        "ge" => ">=",
-                        "lt" => "<",
-                        "le" => "<=",
-                        _ => unreachable!("index_str built by best_index"),
-                    };
-                    fetch_sql.push_str(&format!(" AND {name} {sql_op} ?"));
-                }
+                append_filter_clauses(&mut fetch_sql, &filters, &config.metadata_columns)?;
 
                 let target_k = k;
                 // Short-circuit: when target_k == 0, return no rows immediately
@@ -159,18 +141,7 @@ impl VTabCursor for VectorCursor {
                 if config.mode == IndexMode::Exact {
                     // Brute-force streaming top-k with pushed filters applied in SQL.
                     let mut scan_sql = format!("{} WHERE 1=1", sql.scan_all);
-                    for (col, op) in &filters {
-                        let name = &config.metadata_columns[col - 2].0;
-                        let sql_op = match *op {
-                            "eq" => "=",
-                            "gt" => ">",
-                            "ge" => ">=",
-                            "lt" => "<",
-                            "le" => "<=",
-                            _ => unreachable!("index_str built by best_index"),
-                        };
-                        scan_sql.push_str(&format!(" AND {name} {sql_op} ?"));
-                    }
+                    append_filter_clauses(&mut scan_sql, &filters, &config.metadata_columns)?;
                     let mut stmt = db.prepare(&scan_sql)?;
                     stmt.query(|q: &mut sqlite3_ext::query::Statement| {
                         for (i, arg) in filter_args.iter_mut().enumerate() {
@@ -344,6 +315,68 @@ impl VTabCursor for VectorCursor {
     fn rowid(&mut self) -> Result<i64> {
         Ok(self.current_id())
     }
+}
+
+// ---------------------------------------------------------------------------
+// index_str filter parsing / SQL building — shared by the ANN fetch_sql path
+// and the exact-mode scan_sql path so the op-match table and clause-building
+// logic exist in exactly one place.
+// ---------------------------------------------------------------------------
+
+/// Map a `best_index`-assigned op token to its SQL operator. `index_str` is
+/// entirely constructed by this crate's own `best_index` (see mod.rs), so an
+/// unrecognized token indicates an internal invariant violation rather than
+/// bad user input — still returned as an `Error::Module` rather than a panic,
+/// since this runs inside a loadable extension `.so`.
+fn filter_sql_op(op: &str) -> Result<&'static str> {
+    match op {
+        "eq" => Ok("="),
+        "gt" => Ok(">"),
+        "ge" => Ok(">="),
+        "lt" => Ok("<"),
+        "le" => Ok("<="),
+        other => Err(Error::Module(format!(
+            "internal error: unknown filter op '{other}' in index_str"
+        ))),
+    }
+}
+
+/// Parse the `f=<col>:<op>,<col>:<op>,...` portion of `index_str` built by
+/// `best_index`. Returns `Error::Module` instead of panicking on malformed
+/// input — this is an internal invariant (only this crate ever produces
+/// `index_str`), but a loadable extension should never let SQLite crash the
+/// host process on a parse failure.
+fn parse_index_str_filters(filter_part: &str) -> Result<Vec<(usize, &str)>> {
+    filter_part
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let (col, op) = s.split_once(':').ok_or_else(|| {
+                Error::Module(format!("internal error: malformed index_str filter '{s}'"))
+            })?;
+            let col: usize = col.parse().map_err(|_| {
+                Error::Module(format!(
+                    "internal error: non-numeric column in index_str filter '{s}'"
+                ))
+            })?;
+            Ok((col, op))
+        })
+        .collect()
+}
+
+/// Append ` AND <col> <op> ?` clauses for each pushed filter to `sql`, using
+/// the metadata column name at `col - 2` (columns 0/1 are id/vector).
+fn append_filter_clauses(
+    sql: &mut String,
+    filters: &[(usize, &str)],
+    metadata_columns: &[(String, String)],
+) -> Result<()> {
+    for (col, op) in filters {
+        let name = &metadata_columns[col - 2].0;
+        let sql_op = filter_sql_op(op)?;
+        sql.push_str(&format!(" AND {name} {sql_op} ?"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -131,6 +131,15 @@ impl VectorType {
 
     /// Cast a byte blob back to a typed slice. Generic helper.
     /// Caller must ensure the blob was created with the matching type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `blob`'s length isn't a multiple of `size_of::<T>()`, or if
+    /// `blob`'s address isn't aligned for `T` (`bytemuck::cast_slice`'s
+    /// contract). SQLite blob pointers and arbitrary `Vec<u8>` buffers are
+    /// not guaranteed to satisfy the alignment requirement. When the input
+    /// may be misaligned, use [`cast_blob`] instead, which falls back to an
+    /// owned, correctly-aligned copy rather than panicking.
     pub fn blob_to_slice<'a, T: Pod>(&self, blob: &'a [u8]) -> &'a [T] {
         cast_slice(blob)
     }
