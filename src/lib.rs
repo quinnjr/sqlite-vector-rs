@@ -94,7 +94,10 @@ fn find_extension_path() -> Option<String> {
         if Path::new(&val).exists() {
             return Some(val);
         }
-        if extensions.iter().any(|ext| Path::new(&format!("{val}{ext}")).exists()) {
+        if extensions
+            .iter()
+            .any(|ext| Path::new(&format!("{val}{ext}")).exists())
+        {
             return Some(val);
         }
     }

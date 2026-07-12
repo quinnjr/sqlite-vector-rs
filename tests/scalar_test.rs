@@ -62,11 +62,7 @@ fn rebuild_index_on_existing_table() {
 
     // Rebuild the index from scratch
     let count: i64 = conn
-        .query_row(
-            "SELECT vector_rebuild_index('emb')",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT vector_rebuild_index('emb')", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 3);
 }
@@ -78,11 +74,7 @@ fn rebuild_index_empty_table() {
         .unwrap();
 
     let count: i64 = conn
-        .query_row(
-            "SELECT vector_rebuild_index('emb')",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT vector_rebuild_index('emb')", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
 }
@@ -178,11 +170,9 @@ fn rebuild_index_preserves_shadow_data() {
         .unwrap();
 
     // Rebuild the HNSW index
-    conn.query_row(
-        "SELECT vector_rebuild_index('emb')",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
+    conn.query_row("SELECT vector_rebuild_index('emb')", [], |row| {
+        row.get::<_, i64>(0)
+    })
     .unwrap();
 
     // KNN search should still work after rebuild — but note the in-memory

@@ -115,7 +115,12 @@ fn embed(bundle: &mut ModelBundle, text: &str) -> Vec<f32> {
     bundle
         .extractor
         .embed_text(&bundle.model, &bundle.tokenizer, &mut bundle.ctx, text)
-        .unwrap_or_else(|e| panic!("embed_text failed for {:?}: {e}", &text[..text.len().min(40)]))
+        .unwrap_or_else(|e| {
+            panic!(
+                "embed_text failed for {:?}: {e}",
+                &text[..text.len().min(40)]
+            )
+        })
 }
 
 /// Simple Shakespeare text chunks for testing (avoids PDF dependency in this
@@ -338,7 +343,10 @@ fn different_passages_produce_different_embeddings() {
     let emb_b = embed(&mut bundle, PASSAGES[4]); // very different content
 
     // Embeddings should not be identical.
-    assert_ne!(emb_a, emb_b, "different passages must produce different embeddings");
+    assert_ne!(
+        emb_a, emb_b,
+        "different passages must produce different embeddings"
+    );
 
     // Compute cosine similarity — should be < 1.0.
     let dot: f32 = emb_a.iter().zip(emb_b.iter()).map(|(a, b)| a * b).sum();
@@ -356,12 +364,7 @@ fn batch_embed_multiple_passages() {
     let texts: Vec<&str> = PASSAGES.to_vec();
     let embeddings = bundle
         .extractor
-        .embed_batch(
-            &bundle.model,
-            &bundle.tokenizer,
-            &mut bundle.ctx,
-            &texts,
-        )
+        .embed_batch(&bundle.model, &bundle.tokenizer, &mut bundle.ctx, &texts)
         .expect("embed_batch failed");
 
     assert_eq!(embeddings.len(), PASSAGES.len());

@@ -304,7 +304,9 @@ impl Registry {
         match matches.len() {
             0 => Err(format!("no vector table named {name}")),
             1 => Ok(matches.remove(0)),
-            _ => Err(format!("ambiguous table name '{name}'; qualify as 'db.{name}'")),
+            _ => Err(format!(
+                "ambiguous table name '{name}'; qualify as 'db.{name}'"
+            )),
         }
     }
 }
@@ -347,8 +349,13 @@ pub fn reconcile_index(
     // Graph holds keys that no longer exist in _data (deletes lost since the
     // last persist): rebuild from scratch, reusing the rows collected above
     // instead of re-querying `_data`.
-    let fresh = HnswIndex::new(config.dim, config.vtype, config.metric, Some(config.hnsw_params))
-        .map_err(|e| Error::Module(e.to_string()))?;
+    let fresh = HnswIndex::new(
+        config.dim,
+        config.vtype,
+        config.metric,
+        Some(config.hnsw_params),
+    )
+    .map_err(|e| Error::Module(e.to_string()))?;
     for (id, vector) in &rows {
         fresh
             .add(*id as u64, vector)
@@ -373,11 +380,9 @@ fn init(
     // shadow tables and the on-disk vectors), while m/ef_construction/ef_search
     // are HNSW tuning knobs where the persisted values always win, since the
     // caller may omit them on subsequent CREATE VIRTUAL TABLE (re)connects.
-    if verify_against_meta
-        && let Some(meta) = load_meta_from_shadow(db, &config.table_name)?
-    {
-        let (dim, vtype, metric, params) = VectorTableConfig::params_from_meta(&meta)
-            .map_err(|e| Error::Module(e.to_string()))?;
+    if verify_against_meta && let Some(meta) = load_meta_from_shadow(db, &config.table_name)? {
+        let (dim, vtype, metric, params) =
+            VectorTableConfig::params_from_meta(&meta).map_err(|e| Error::Module(e.to_string()))?;
         if dim != config.dim || vtype != config.vtype || metric != config.metric {
             return Err(Error::Module(format!(
                 "declared parameters disagree with persisted meta for {}",
@@ -858,9 +863,7 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 } else if args[2].is_null() {
                     // Vector is NOT NULL at the schema level; a genuine (non-nochange)
                     // NULL means the statement tried to null out the vector column.
-                    return Err(Error::Module(
-                        "vector column cannot be NULL".to_string(),
-                    ));
+                    return Err(Error::Module("vector column cannot be NULL".to_string()));
                 } else {
                     let blob = args[2].get_blob()?.to_vec();
                     self.config

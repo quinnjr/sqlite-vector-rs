@@ -134,7 +134,10 @@ impl VTabCursor for VectorCursor {
                 let target_k = k;
                 // Short-circuit: when target_k == 0, return no rows immediately
                 if target_k == 0 {
-                    self.mode = CursorMode::Knn { results: Vec::new(), pos: 0 };
+                    self.mode = CursorMode::Knn {
+                        results: Vec::new(),
+                        pos: 0,
+                    };
                     return Ok(());
                 }
 

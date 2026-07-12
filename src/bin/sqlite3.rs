@@ -1,12 +1,15 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
-use rusqlite::types::Value;
 use rusqlite::Connection;
+use rusqlite::types::Value;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.iter().any(|a| a == "-h" || a == "--help" || a == "-help") {
+    if args
+        .iter()
+        .any(|a| a == "-h" || a == "--help" || a == "-help")
+    {
         print_usage(&args[0]);
         return;
     }
@@ -344,9 +347,7 @@ fn handle_dot_command(conn: &Connection, cmd: &str, state: &mut ReplState) {
                     "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '{}' ORDER BY 1;",
                     p.replace('\'', "''")
                 ),
-                None => {
-                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1;".to_string()
-                }
+                None => "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1;".to_string(),
             };
             let list_state = ReplState {
                 headers: false,

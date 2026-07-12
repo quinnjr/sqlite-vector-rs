@@ -72,8 +72,8 @@ fn shakespeare_pdf_to_vector_store() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/shakespeare.pdf"
     );
-    let text = pdf_extract::extract_text(pdf_path)
-        .expect("failed to extract text from shakespeare.pdf");
+    let text =
+        pdf_extract::extract_text(pdf_path).expect("failed to extract text from shakespeare.pdf");
     assert!(
         text.len() > 100_000,
         "expected substantial text from Shakespeare, got {} bytes",
@@ -100,8 +100,11 @@ fn shakespeare_pdf_to_vector_store() {
     for chunk in &chunks {
         let vec = text_to_vector(chunk);
         let blob = VectorType::Float4.slice_to_blob(&vec);
-        conn.execute("INSERT INTO shakespeare(vector) VALUES(?)", [blob.as_slice()])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO shakespeare(vector) VALUES(?)",
+            [blob.as_slice()],
+        )
+        .unwrap();
     }
 
     // Verify row count
@@ -148,11 +151,9 @@ fn shakespeare_pdf_to_vector_store() {
     // --- 5. Verify we can retrieve vector data for each result ---
     for (id, _dist) in &results {
         let blob: Vec<u8> = conn
-            .query_row(
-                "SELECT vector FROM shakespeare WHERE id = ?",
-                [id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT vector FROM shakespeare WHERE id = ?", [id], |row| {
+                row.get(0)
+            })
             .unwrap();
         let expected_size = VectorType::Float4.blob_size(EMBED_DIM);
         assert_eq!(
@@ -408,10 +409,7 @@ fn shakespeare_self_distance_is_zero() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(
-        dist.abs() < 1e-6,
-        "self-distance should be ~0, got {dist}"
-    );
+    assert!(dist.abs() < 1e-6, "self-distance should be ~0, got {dist}");
 }
 
 // ---------------------------------------------------------------------------
@@ -469,11 +467,9 @@ fn shakespeare_rebuild_index() {
     populate_table(&conn, "shk_rebuild", VectorType::Float4, "l2", &chunks, n);
 
     let rebuilt: i64 = conn
-        .query_row(
-            "SELECT vector_rebuild_index('shk_rebuild')",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT vector_rebuild_index('shk_rebuild')", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(rebuilt, n as i64);
 
@@ -496,9 +492,7 @@ fn shakespeare_full_scan() {
     populate_table(&conn, "shk_scan", VectorType::Float4, "cosine", &chunks, n);
 
     // Full table scan (no knn_match constraint) should return all rows
-    let mut stmt = conn
-        .prepare("SELECT id, vector FROM shk_scan")
-        .unwrap();
+    let mut stmt = conn.prepare("SELECT id, vector FROM shk_scan").unwrap();
     let rows: Vec<(i64, Vec<u8>)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
@@ -509,11 +503,7 @@ fn shakespeare_full_scan() {
     // Every vector should have the correct blob size
     let expected_size = VectorType::Float4.blob_size(EMBED_DIM);
     for (id, blob) in &rows {
-        assert_eq!(
-            blob.len(),
-            expected_size,
-            "wrong blob size for row {id}"
-        );
+        assert_eq!(blob.len(), expected_size, "wrong blob size for row {id}");
     }
 }
 
@@ -574,22 +564,13 @@ fn shakespeare_knn_varying_k() {
     let chunks = load_shakespeare_chunks();
     let conn = open_with_extension();
     let n = 100;
-    populate_table(
-        &conn,
-        "shk_k",
-        VectorType::Float4,
-        "cosine",
-        &chunks,
-        n,
-    );
+    populate_table(&conn, "shk_k", VectorType::Float4, "cosine", &chunks, n);
 
     let query_blob =
         VectorType::Float4.slice_to_blob(&text_to_vector("the lady doth protest too much"));
 
     for k in [1, 5, 10, 50] {
-        let sql = format!(
-            "SELECT id, distance FROM shk_k WHERE knn_match(distance, ?) LIMIT {k}"
-        );
+        let sql = format!("SELECT id, distance FROM shk_k WHERE knn_match(distance, ?) LIMIT {k}");
         let mut stmt = conn.prepare(&sql).unwrap();
         let results: Vec<(i64, f64)> = stmt
             .query_map(params![query_blob.as_slice()], |row| {
@@ -673,14 +654,7 @@ fn shakespeare_insert_delete_all_empty() {
     let chunks = load_shakespeare_chunks();
     let conn = open_with_extension();
     let n = 20;
-    populate_table(
-        &conn,
-        "shk_empty",
-        VectorType::Float4,
-        "l2",
-        &chunks,
-        n,
-    );
+    populate_table(&conn, "shk_empty", VectorType::Float4, "l2", &chunks, n);
 
     // Delete every row
     for id in 1..=n {
@@ -747,14 +721,7 @@ fn shakespeare_large_batch() {
     let conn = open_with_extension();
     // Use all available chunks (typically 500+)
     let n = chunks.len().min(500);
-    let used = populate_table(
-        &conn,
-        "shk_large",
-        VectorType::Float4,
-        "cosine",
-        &chunks,
-        n,
-    );
+    let used = populate_table(&conn, "shk_large", VectorType::Float4, "cosine", &chunks, n);
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM shk_large", [], |row| row.get(0))
@@ -808,10 +775,6 @@ fn chunk_text_respects_boundaries() {
     assert!(!chunks.is_empty());
     for chunk in &chunks {
         // No chunk should be drastically longer than target + one word
-        assert!(
-            chunk.len() <= 35,
-            "chunk too long: {} chars",
-            chunk.len()
-        );
+        assert!(chunk.len() <= 35, "chunk too long: {} chars", chunk.len());
     }
 }

@@ -93,7 +93,9 @@ pub fn compute_distance(
             let va = cast_blob::<f16>(a);
             let vb = cast_blob::<f16>(b);
             Ok(scalar_distance_pairs(
-                va.iter().zip(vb.iter()).map(|(x, y)| (x.to_f32(), y.to_f32())),
+                va.iter()
+                    .zip(vb.iter())
+                    .map(|(x, y)| (x.to_f32(), y.to_f32())),
                 metric,
             ))
         }
@@ -101,7 +103,9 @@ pub fn compute_distance(
             let va = cast_blob::<i8>(a);
             let vb = cast_blob::<i8>(b);
             Ok(scalar_distance_pairs(
-                va.iter().zip(vb.iter()).map(|(x, y)| (*x as f32, *y as f32)),
+                va.iter()
+                    .zip(vb.iter())
+                    .map(|(x, y)| (*x as f32, *y as f32)),
                 metric,
             ))
         }
@@ -109,7 +113,9 @@ pub fn compute_distance(
             let va = cast_blob::<i16>(a);
             let vb = cast_blob::<i16>(b);
             Ok(scalar_distance_pairs(
-                va.iter().zip(vb.iter()).map(|(x, y)| (*x as f32, *y as f32)),
+                va.iter()
+                    .zip(vb.iter())
+                    .map(|(x, y)| (*x as f32, *y as f32)),
                 metric,
             ))
         }
@@ -117,17 +123,16 @@ pub fn compute_distance(
             let va = cast_blob::<i32>(a);
             let vb = cast_blob::<i32>(b);
             Ok(scalar_distance_pairs(
-                va.iter().zip(vb.iter()).map(|(x, y)| (*x as f32, *y as f32)),
+                va.iter()
+                    .zip(vb.iter())
+                    .map(|(x, y)| (*x as f32, *y as f32)),
                 metric,
             ))
         }
     }
 }
 
-fn scalar_distance_pairs(
-    pairs: impl Iterator<Item = (f32, f32)>,
-    metric: DistanceMetric,
-) -> f64 {
+fn scalar_distance_pairs(pairs: impl Iterator<Item = (f32, f32)>, metric: DistanceMetric) -> f64 {
     match metric {
         DistanceMetric::L2 => pairs
             .map(|(x, y)| {
@@ -135,15 +140,17 @@ fn scalar_distance_pairs(
                 d * d
             })
             .sum::<f32>() as f64,
-        DistanceMetric::InnerProduct => {
-            -(pairs.map(|(x, y)| x * y).sum::<f32>() as f64)
-        }
+        DistanceMetric::InnerProduct => -(pairs.map(|(x, y)| x * y).sum::<f32>() as f64),
         DistanceMetric::Cosine => {
             let (dot, na, nb) = pairs.fold((0f32, 0f32, 0f32), |(d, a, b), (x, y)| {
                 (d + x * y, a + x * x, b + y * y)
             });
             let denom = na.sqrt() * nb.sqrt();
-            if denom == 0.0 { 1.0 } else { 1.0 - (dot / denom) as f64 }
+            if denom == 0.0 {
+                1.0
+            } else {
+                1.0 - (dot / denom) as f64
+            }
         }
     }
 }
@@ -604,15 +611,32 @@ mod tests {
 
     #[test]
     fn float2_matches_f32_reference() {
-        let a: Vec<half::f16> = [0.5f32, -1.0, 2.0].iter().map(|v| half::f16::from_f32(*v)).collect();
-        let b: Vec<half::f16> = [1.5f32, 0.25, -2.0].iter().map(|v| half::f16::from_f32(*v)).collect();
+        let a: Vec<half::f16> = [0.5f32, -1.0, 2.0]
+            .iter()
+            .map(|v| half::f16::from_f32(*v))
+            .collect();
+        let b: Vec<half::f16> = [1.5f32, 0.25, -2.0]
+            .iter()
+            .map(|v| half::f16::from_f32(*v))
+            .collect();
         let blob_a = cast_slice(&a).to_vec();
         let blob_b = cast_slice(&b).to_vec();
-        for metric in [DistanceMetric::L2, DistanceMetric::Cosine, DistanceMetric::InnerProduct] {
+        for metric in [
+            DistanceMetric::L2,
+            DistanceMetric::Cosine,
+            DistanceMetric::InnerProduct,
+        ] {
             let d16 = compute_distance(&blob_a, &blob_b, VectorType::Float2, metric, 3).unwrap();
             let fa: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();
             let fb: Vec<f32> = b.iter().map(|v| v.to_f32()).collect();
-            let dref = compute_distance(cast_slice(&fa), cast_slice(&fb), VectorType::Float4, metric, 3).unwrap();
+            let dref = compute_distance(
+                cast_slice(&fa),
+                cast_slice(&fb),
+                VectorType::Float4,
+                metric,
+                3,
+            )
+            .unwrap();
             assert!((d16 - dref).abs() < 1e-3, "{metric:?}: {d16} vs {dref}");
         }
     }

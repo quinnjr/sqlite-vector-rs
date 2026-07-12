@@ -189,7 +189,8 @@ impl VectorTableConfig {
             as usize;
         let ef_search = meta["ef_search"]
             .as_u64()
-            .ok_or_else(|| ConfigError("meta missing ef_search".into()))? as usize;
+            .ok_or_else(|| ConfigError("meta missing ef_search".into()))?
+            as usize;
         let params = HnswParams {
             m,
             ef_construction,

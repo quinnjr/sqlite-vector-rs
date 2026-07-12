@@ -28,7 +28,10 @@ fn unpersisted_commits_survive_reconnect_via_reconcile() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(n, 10, "reconcile must recover rows committed after the last persist");
+    assert_eq!(
+        n, 10,
+        "reconcile must recover rows committed after the last persist"
+    );
 }
 
 #[test]
@@ -77,10 +80,18 @@ fn vector_sync_index_persists_graph_and_state() {
     conn.query_row("SELECT vector_sync_index('t')", [], |r| r.get::<_, i64>(0))
         .unwrap();
     let has_graph: i64 = conn
-        .query_row("SELECT count(*) FROM t_index WHERE key = 'hnsw_graph'", [], |r| r.get(0))
+        .query_row(
+            "SELECT count(*) FROM t_index WHERE key = 'hnsw_graph'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     let state: String = conn
-        .query_row("SELECT value FROM t_index WHERE key = 'graph_state'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM t_index WHERE key = 'graph_state'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(has_graph, 1);
     let v: serde_json::Value = serde_json::from_str(&state).unwrap();
@@ -121,8 +132,11 @@ fn autocommit_inserts_within_3x_of_single_transaction() {
         .unwrap();
     let t0 = Instant::now();
     for _ in 0..2000 {
-        conn.execute("INSERT INTO a(vector) VALUES (vector_from_json(?1, 'float4'))", [json])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO a(vector) VALUES (vector_from_json(?1, 'float4'))",
+            [json],
+        )
+        .unwrap();
     }
     let auto = t0.elapsed();
 
@@ -134,7 +148,10 @@ fn autocommit_inserts_within_3x_of_single_transaction() {
     conn2.execute_batch("BEGIN").unwrap();
     for _ in 0..2000 {
         conn2
-            .execute("INSERT INTO b(vector) VALUES (vector_from_json(?1, 'float4'))", [json])
+            .execute(
+                "INSERT INTO b(vector) VALUES (vector_from_json(?1, 'float4'))",
+                [json],
+            )
             .unwrap();
     }
     conn2.execute_batch("COMMIT").unwrap();
@@ -178,7 +195,11 @@ fn filtered_knn_returns_full_limit_beyond_default_k() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(ids.len(), 3, "oversampling must reach past the crowd of 'b' rows");
+    assert_eq!(
+        ids.len(),
+        3,
+        "oversampling must reach past the crowd of 'b' rows"
+    );
 }
 
 #[test]
@@ -237,7 +258,11 @@ fn exact_mode_knn_matches_hnsw_results() {
         .collect::<Result<_, _>>()
         .unwrap()
     };
-    assert_eq!(get("eh"), get("ee"), "exact and hnsw must agree on this small table");
+    assert_eq!(
+        get("eh"),
+        get("ee"),
+        "exact and hnsw must agree on this small table"
+    );
 }
 
 #[test]
@@ -274,7 +299,9 @@ fn duplicate_metadata_constraints_do_not_crash_best_index() {
     for t in ["dup_hnsw", "dup_exact"] {
         for i in 0..5 {
             conn.execute(
-                &format!("INSERT INTO {t}(vector, score) VALUES (vector_from_json(?1, 'float4'), ?2)"),
+                &format!(
+                    "INSERT INTO {t}(vector, score) VALUES (vector_from_json(?1, 'float4'), ?2)"
+                ),
                 rusqlite::params![format!("[{}.0, 0.0]", i), i as f64],
             )
             .unwrap();
@@ -295,7 +322,11 @@ fn duplicate_metadata_constraints_do_not_crash_best_index() {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(ids, vec![5], "table {t}: expected only the row with score=4.0 (id=5)");
+        assert_eq!(
+            ids,
+            vec![5],
+            "table {t}: expected only the row with score=4.0 (id=5)"
+        );
     }
 }
 
@@ -360,8 +391,10 @@ fn index_info_reports_state_and_ef_search_is_adjustable() {
     assert_eq!(v["mode"], "hnsw");
     assert_eq!(v["ef_search"], 32);
 
-    conn.query_row("SELECT vector_ef_search('ii', 128)", [], |r| r.get::<_, i64>(0))
-        .unwrap();
+    conn.query_row("SELECT vector_ef_search('ii', 128)", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .unwrap();
     let info2: String = conn
         .query_row("SELECT vector_index_info('ii')", [], |r| r.get(0))
         .unwrap();
@@ -391,7 +424,10 @@ fn vector_utility_functions() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(serde_json::from_str::<Vec<f64>>(&s).unwrap(), vec![4.0, 6.0]);
+    assert_eq!(
+        serde_json::from_str::<Vec<f64>>(&s).unwrap(),
+        vec![4.0, 6.0]
+    );
 
     let d: String = conn
         .query_row(
@@ -400,7 +436,10 @@ fn vector_utility_functions() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(serde_json::from_str::<Vec<f64>>(&d).unwrap(), vec![2.5, -5.0]);
+    assert_eq!(
+        serde_json::from_str::<Vec<f64>>(&d).unwrap(),
+        vec![2.5, -5.0]
+    );
 
     // slice: elements [1, 3) of a 4-dim vector
     let sl: String = conn
@@ -410,7 +449,10 @@ fn vector_utility_functions() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(serde_json::from_str::<Vec<f64>>(&sl).unwrap(), vec![1.0, 2.0]);
+    assert_eq!(
+        serde_json::from_str::<Vec<f64>>(&sl).unwrap(),
+        vec![1.0, 2.0]
+    );
 
     // quantize: [0.0, 127-max scaling] — max_abs=2.0 -> scale 63.5
     // Note: -1.0 * 63.5 = -63.5, which rounds to -64 (round-half-away-from-zero)
@@ -421,7 +463,10 @@ fn vector_utility_functions() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(serde_json::from_str::<Vec<i64>>(&q).unwrap(), vec![127, -64]);
+    assert_eq!(
+        serde_json::from_str::<Vec<i64>>(&q).unwrap(),
+        vec![127, -64]
+    );
 
     // error cases
     assert!(conn
@@ -431,20 +476,24 @@ fn vector_utility_functions() {
             |r| r.get::<_, Vec<u8>>(0),
         )
         .is_err(), "dimension mismatch must error");
-    assert!(conn
-        .query_row(
+    assert!(
+        conn.query_row(
             "SELECT vector_normalize(vector_from_json('[0.0, 0.0]', 'float4'), 'float4')",
             [],
             |r| r.get::<_, Vec<u8>>(0),
         )
-        .is_err(), "zero vector cannot be normalized");
-    assert!(conn
-        .query_row(
+        .is_err(),
+        "zero vector cannot be normalized"
+    );
+    assert!(
+        conn.query_row(
             "SELECT vector_slice(vector_from_json('[1.0, 2.0]', 'float4'), 'float4', 1, 5)",
             [],
             |r| r.get::<_, Vec<u8>>(0),
         )
-        .is_err(), "out-of-bounds slice must error");
+        .is_err(),
+        "out-of-bounds slice must error"
+    );
 }
 
 #[test]
@@ -577,7 +626,10 @@ fn mid_transaction_sync_then_rollback_recovers() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(n2, 2, "post-rollback insert must succeed with no duplicate-key error");
+    assert_eq!(
+        n2, 2,
+        "post-rollback insert must succeed with no duplicate-key error"
+    );
 }
 
 #[test]
@@ -598,7 +650,9 @@ fn mode_mismatch_at_connect_is_rejected() {
         conn.execute_batch("CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2);")
             .unwrap();
         let meta: String = conn
-            .query_row("SELECT value FROM t_index WHERE key = 'meta'", [], |r| r.get(0))
+            .query_row("SELECT value FROM t_index WHERE key = 'meta'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let mut v: serde_json::Value = serde_json::from_str(&meta).unwrap();
         // The CREATE VIRTUAL TABLE arguments above declare the default mode
@@ -616,7 +670,8 @@ fn mode_mismatch_at_connect_is_rejected() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("disagrees with persisted meta") || msg.contains("disagree with persisted meta"),
+        msg.contains("disagrees with persisted meta")
+            || msg.contains("disagree with persisted meta"),
         "expected a persisted-meta disagreement error from connect-time verification, got: {msg}"
     );
 }
@@ -639,7 +694,9 @@ fn exact_mode_table_functions_reject_with_mode_exact_message() {
     );
 
     let err = conn
-        .query_row("SELECT vector_rebuild_index('ex')", [], |r| r.get::<_, i64>(0))
+        .query_row("SELECT vector_rebuild_index('ex')", [], |r| {
+            r.get::<_, i64>(0)
+        })
         .unwrap_err();
     assert!(
         err.to_string().contains("mode=exact"),
@@ -647,7 +704,9 @@ fn exact_mode_table_functions_reject_with_mode_exact_message() {
     );
 
     let err = conn
-        .query_row("SELECT vector_ef_search('ex', 64)", [], |r| r.get::<_, i64>(0))
+        .query_row("SELECT vector_ef_search('ex', 64)", [], |r| {
+            r.get::<_, i64>(0)
+        })
         .unwrap_err();
     assert!(
         err.to_string().contains("mode=exact"),

@@ -43,7 +43,10 @@ fn update_preserves_rowid_and_index() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(nearest, 1, "KNN must find the updated vector under its original id");
+    assert_eq!(
+        nearest, 1,
+        "KNN must find the updated vector under its original id"
+    );
 }
 
 #[test]
@@ -51,8 +54,11 @@ fn update_can_change_rowid() {
     let conn = open_with_extension();
     create_2d(&conn);
     insert_json(&conn, "[1.0, 0.0]");
-    conn.execute_batch("UPDATE t SET id = 7 WHERE id = 1;").unwrap();
-    let id: i64 = conn.query_row("SELECT id FROM t", [], |r| r.get(0)).unwrap();
+    conn.execute_batch("UPDATE t SET id = 7 WHERE id = 1;")
+        .unwrap();
+    let id: i64 = conn
+        .query_row("SELECT id FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(id, 7);
     let nearest: i64 = conn
         .query_row(
@@ -189,7 +195,10 @@ fn update_metadata_to_null_sets_null() {
             r.get(0)
         })
         .unwrap();
-    assert!(is_null, "explicit SET label = NULL must actually null the column");
+    assert!(
+        is_null,
+        "explicit SET label = NULL must actually null the column"
+    );
 }
 
 #[test]
@@ -229,7 +238,9 @@ fn insert_with_explicit_rowid() {
         "INSERT INTO t(id, vector) VALUES (42, vector_from_json('[2.0, 2.0]', 'float4'));",
     )
     .unwrap();
-    let id: i64 = conn.query_row("SELECT id FROM t", [], |r| r.get(0)).unwrap();
+    let id: i64 = conn
+        .query_row("SELECT id FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(id, 42);
     let nearest: i64 = conn
         .query_row(
@@ -252,7 +263,10 @@ fn insert_duplicate_rowid_errors() {
     let err = conn.execute_batch(
         "INSERT INTO t(id, vector) VALUES (5, vector_from_json('[0.0, 1.0]', 'float4'));",
     );
-    assert!(err.is_err(), "duplicate explicit rowid must be a constraint error");
+    assert!(
+        err.is_err(),
+        "duplicate explicit rowid must be a constraint error"
+    );
 }
 
 #[test]
@@ -271,7 +285,11 @@ fn metadata_columns_keep_declared_types() {
     assert_eq!((t_label.as_str(), t_score.as_str()), ("text", "real"));
 
     let n: i64 = conn
-        .query_row("SELECT count(*) FROM m WHERE label = 'a' AND score > 1.0", [], |r| r.get(0))
+        .query_row(
+            "SELECT count(*) FROM m WHERE label = 'a' AND score > 1.0",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 1, "metadata filters must match typed values");
 
@@ -321,7 +339,9 @@ fn rebuild_index_one_arg_uses_persisted_config() {
     assert_eq!(n, 2);
     // Meta row must exist and carry the table's parameters.
     let meta: String = conn
-        .query_row("SELECT value FROM r_index WHERE key = 'meta'", [], |r| r.get(0))
+        .query_row("SELECT value FROM r_index WHERE key = 'meta'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
     assert_eq!(v["metric"], "cosine");
