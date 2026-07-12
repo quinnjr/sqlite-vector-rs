@@ -581,6 +581,116 @@ fn mid_transaction_sync_then_rollback_recovers() {
 }
 
 #[test]
+fn mode_mismatch_at_connect_is_rejected() {
+    // CREATE VIRTUAL TABLE cannot be re-run against a table that already
+    // exists in sqlite_master, so connect-time verification (init()'s
+    // verify_against_meta path in src/vtab/mod.rs) can't be exercised by
+    // simply re-issuing the original CREATE VIRTUAL TABLE. Instead, corrupt
+    // the persisted `meta` row directly via plain SQL on the `_index` shadow
+    // table (an ordinary table, not the vtab itself), then reopen the file
+    // and reference the table: SQLite invokes xConnect (not xCreate) the
+    // first time a table already declared in sqlite_master is referenced by
+    // a new connection, which is exactly where the mismatch check runs.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    {
+        let conn = open_file_with_extension(&path);
+        conn.execute_batch("CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2);")
+            .unwrap();
+        let meta: String = conn
+            .query_row("SELECT value FROM t_index WHERE key = 'meta'", [], |r| r.get(0))
+            .unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        // The CREATE VIRTUAL TABLE arguments above declare the default mode
+        // (hnsw); flip the persisted value to "exact" so it disagrees.
+        v["mode"] = serde_json::Value::String("exact".to_string());
+        conn.execute(
+            "UPDATE t_index SET value = ?1 WHERE key = 'meta'",
+            [v.to_string()],
+        )
+        .unwrap();
+    }
+    let conn = open_file_with_extension(&path);
+    let err = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("disagrees with persisted meta") || msg.contains("disagree with persisted meta"),
+        "expected a persisted-meta disagreement error from connect-time verification, got: {msg}"
+    );
+}
+
+#[test]
+fn exact_mode_table_functions_reject_with_mode_exact_message() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE ex USING vector(dim=2, type=float4, metric=l2, mode=exact);
+         INSERT INTO ex(vector) VALUES (vector_from_json('[1.0, 0.0]', 'float4'));",
+    )
+    .unwrap();
+
+    let err = conn
+        .query_row("SELECT vector_sync_index('ex')", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("mode=exact"),
+        "vector_sync_index on mode=exact table: expected 'mode=exact' in error, got: {err}"
+    );
+
+    let err = conn
+        .query_row("SELECT vector_rebuild_index('ex')", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("mode=exact"),
+        "vector_rebuild_index on mode=exact table: expected 'mode=exact' in error, got: {err}"
+    );
+
+    let err = conn
+        .query_row("SELECT vector_ef_search('ex', 64)", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("mode=exact"),
+        "vector_ef_search on mode=exact table: expected 'mode=exact' in error, got: {err}"
+    );
+}
+
+#[test]
+fn ef_search_survives_file_reconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    {
+        let conn = open_file_with_extension(&path);
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING vector(dim=4, type=float4, metric=l2);
+             INSERT INTO t(vector) VALUES (vector_from_json('[1.0, 0.0, 0.0, 0.0]', 'float4'));",
+        )
+        .unwrap();
+        let new_ef: i64 = conn
+            .query_row("SELECT vector_ef_search('t', 128)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(new_ef, 128);
+    }
+    let conn = open_file_with_extension(&path);
+    // The scalar functions look the table up in the in-process registry,
+    // which is only populated by connect()/create(); reference the vtab
+    // itself first so SQLite invokes xConnect (and init() picks up the
+    // persisted ef_search via VectorTableConfig::params_from_meta) before
+    // querying vector_index_info.
+    let _: i64 = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    let info: String = conn
+        .query_row("SELECT vector_index_info('t')", [], |r| r.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(
+        v["ef_search"], 128,
+        "ef_search set before close must round-trip through the persisted meta on reconnect"
+    );
+}
+
+#[test]
 fn multiple_knn_match_constraints_are_rejected() {
     let conn = open_with_extension();
     conn.execute_batch(
