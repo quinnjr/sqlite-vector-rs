@@ -121,7 +121,7 @@ impl VTabCursor for VectorCursor {
                     args[1].get_i64() as usize
                 } else {
                     // Default k when no LIMIT is specified
-                    100
+                    crate::vtab::DEFAULT_KNN_K
                 };
 
                 let state = self.state.borrow();

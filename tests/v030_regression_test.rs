@@ -285,3 +285,48 @@ fn metadata_columns_keep_declared_types() {
         .unwrap();
     assert_eq!(t_knn, "text");
 }
+
+#[test]
+fn order_by_distance_desc_returns_farthest() {
+    let conn = open_with_extension();
+    create_2d(&conn);
+    for j in ["[0.0, 0.0]", "[1.0, 1.0]", "[2.0, 2.0]", "[3.0, 3.0]"] {
+        insert_json(&conn, j);
+    }
+    let ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4'))
+             ORDER BY distance DESC LIMIT 2",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![4, 3], "DESC must return the two farthest rows");
+}
+
+#[test]
+fn knn_with_metadata_filter_does_not_truncate() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE f USING vector(dim=2, type=float4, metric=l2, metadata=\"label TEXT\");
+         INSERT INTO f(vector, label) VALUES (vector_from_json('[0.0, 0.0]', 'float4'), 'b');
+         INSERT INTO f(vector, label) VALUES (vector_from_json('[0.1, 0.1]', 'float4'), 'b');
+         INSERT INTO f(vector, label) VALUES (vector_from_json('[2.0, 2.0]', 'float4'), 'a');
+         INSERT INTO f(vector, label) VALUES (vector_from_json('[3.0, 3.0]', 'float4'), 'a');",
+    )
+    .unwrap();
+    let ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM f WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4'))
+             AND label = 'a' LIMIT 2",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids.len(), 2, "filter must not shrink results below LIMIT");
+    assert_eq!(ids, vec![3, 4]);
+}

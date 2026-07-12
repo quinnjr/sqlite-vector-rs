@@ -23,6 +23,9 @@ use crate::vtab::transaction::{IndexState, VectorTransaction};
 const INDEX_SCAN: i32 = 0;
 const INDEX_KNN: i32 = 1;
 
+/// Default ANN candidate count when no LIMIT is safely consumable as k.
+pub const DEFAULT_KNN_K: usize = 100;
+
 /// The virtual table implementation for vector search.
 ///
 /// `db` is a raw pointer to the VTabConnection that SQLite provides to connect/create.
@@ -205,34 +208,56 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
         // Distance column index = 2 + num_metadata_cols
         let distance_col = (2 + self.config.metadata_columns.len()) as i32;
 
-        let mut found_knn = false;
-        let mut argv_next: u32 = 1;
+        // Pass 1: classify.
+        let mut has_knn = false;
+        let mut has_limit = false;
+        let mut has_other = false;
+        for c in info.constraints() {
+            if !c.usable() {
+                continue;
+            }
+            if c.column() == distance_col && matches!(c.op(), ConstraintOp::Function(_)) {
+                has_knn = true;
+            } else if matches!(c.op(), ConstraintOp::Limit) {
+                has_limit = true;
+            } else if !matches!(c.op(), ConstraintOp::Offset) {
+                has_other = true;
+            }
+        }
 
+        // ORDER BY is consumable iff absent or exactly `distance ASC`.
+        let mut ob = info.order_by();
+        let (first, second) = (ob.next(), ob.next());
+        let has_order_by = first.is_some();
+        let order_consumable = match (first, second) {
+            (None, _) => true,
+            (Some(o), None) => o.column() == distance_col && !o.desc(),
+            _ => false,
+        };
+
+        let take_limit = has_knn && has_limit && order_consumable && !has_other;
+
+        // Pass 2: assign argv slots. argv 0 = query blob; argv 1 = k (only when taken).
+        let mut argv_next: u32 = 1;
         for mut c in info.constraints() {
             if !c.usable() {
                 continue;
             }
-            if c.column() == distance_col
-                && let ConstraintOp::Function(_) = c.op()
-            {
-                // knn_match(distance_col, query_blob): query_blob passed to filter
+            if c.column() == distance_col && matches!(c.op(), ConstraintOp::Function(_)) {
                 c.set_argv_index(Some(argv_next - 1));
                 c.set_omit(true);
                 argv_next += 1;
-                found_knn = true;
-            }
-            // Capture LIMIT as the k parameter for KNN searches
-            if let ConstraintOp::Limit = c.op()
-                && found_knn
-            {
+            } else if matches!(c.op(), ConstraintOp::Limit) && take_limit {
                 c.set_argv_index(Some(argv_next - 1));
-                c.set_omit(true);
                 argv_next += 1;
             }
         }
 
-        if found_knn {
+        if has_knn {
             info.set_index_num(INDEX_KNN);
+            if has_order_by && order_consumable {
+                info.set_order_by_consumed(true);
+            }
             info.set_estimated_cost(10.0);
             info.set_estimated_rows(10);
         } else {
