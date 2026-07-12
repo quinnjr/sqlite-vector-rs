@@ -185,6 +185,9 @@ Notes on the arithmetic/quantization functions:
   `f64` internally and cast back to the element type on output; results
   saturate (clamp) at the type's min/max on overflow rather than wrapping or
   erroring.
+- `vector_normalize` on an integer-typed vector returns a `float4` blob — a
+  unit-length vector cannot be represented in the integer domain. Float
+  inputs are normalized in place at their own element type.
 - `vector_quantize_int8` scales by `127 / max(|v|)` (symmetric, based on the
   vector's own max absolute value) and rounds half-away-from-zero, clamping
   to `[-127, 127]`.
