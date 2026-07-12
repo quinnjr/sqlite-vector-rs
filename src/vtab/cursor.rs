@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use sqlite3_ext::{
     Error, FallibleIteratorMut, FromValue, Result, Value, ValueRef,
+    query::QueryResult,
     vtab::{ColumnContext, VTabConnection, VTabCursor},
 };
 
@@ -14,8 +15,14 @@ use crate::vtab::transaction::IndexState;
 const INDEX_KNN: i32 = 1;
 
 pub enum CursorMode {
-    Scan { rows: Vec<ScanRow>, pos: usize },
-    Knn { results: Vec<KnnRow>, pos: usize },
+    Scan {
+        stmt: sqlite3_ext::query::Statement,
+        current: Option<ScanRow>,
+    },
+    Knn {
+        results: Vec<KnnRow>,
+        pos: usize,
+    },
 }
 
 pub struct ScanRow {
@@ -48,21 +55,21 @@ unsafe impl Sync for VectorCursor {}
 impl VectorCursor {
     fn current_id(&self) -> i64 {
         match &self.mode {
-            CursorMode::Scan { rows, pos } => rows[*pos].id,
+            CursorMode::Scan { current, .. } => current.as_ref().expect("eof checked").id,
             CursorMode::Knn { results, pos } => results[*pos].id,
         }
     }
 
     fn current_vector(&self) -> &[u8] {
         match &self.mode {
-            CursorMode::Scan { rows, pos } => &rows[*pos].vector,
+            CursorMode::Scan { current, .. } => &current.as_ref().expect("eof checked").vector,
             CursorMode::Knn { results, pos } => &results[*pos].vector,
         }
     }
 
     fn current_metadata(&self) -> &[Value] {
         match &self.mode {
-            CursorMode::Scan { rows, pos } => &rows[*pos].metadata,
+            CursorMode::Scan { current, .. } => &current.as_ref().expect("eof checked").metadata,
             CursorMode::Knn { results, pos } => &results[*pos].metadata,
         }
     }
@@ -71,27 +78,6 @@ impl VectorCursor {
         match &self.mode {
             CursorMode::Scan { .. } => None,
             CursorMode::Knn { results, pos } => Some(results[*pos].distance),
-        }
-    }
-
-    fn len(&self) -> usize {
-        match &self.mode {
-            CursorMode::Scan { rows, .. } => rows.len(),
-            CursorMode::Knn { results, .. } => results.len(),
-        }
-    }
-
-    fn pos(&self) -> usize {
-        match &self.mode {
-            CursorMode::Scan { pos, .. } => *pos,
-            CursorMode::Knn { pos, .. } => *pos,
-        }
-    }
-
-    fn set_pos(&mut self, new_pos: usize) {
-        match &mut self.mode {
-            CursorMode::Scan { pos, .. } => *pos = new_pos,
-            CursorMode::Knn { pos, .. } => *pos = new_pos,
         }
     }
 }
@@ -144,8 +130,14 @@ impl VTabCursor for VectorCursor {
                 self.mode = CursorMode::Knn { results, pos: 0 };
             }
             _ => {
-                let rows = scan_all_rows(db, config)?;
-                self.mode = CursorMode::Scan { rows, pos: 0 };
+                let mut stmt = db.prepare(&ShadowOps::select_all_data_sql(&config.table_name))?;
+                stmt.query(())?;
+                let mut mode = CursorMode::Scan {
+                    stmt,
+                    current: None,
+                };
+                advance_scan(&mut mode, config.metadata_columns.len())?;
+                self.mode = mode;
             }
         }
 
@@ -153,13 +145,22 @@ impl VTabCursor for VectorCursor {
     }
 
     fn next(&mut self) -> Result<()> {
-        let new_pos = self.pos() + 1;
-        self.set_pos(new_pos);
+        match &mut self.mode {
+            CursorMode::Scan { .. } => {
+                advance_scan(&mut self.mode, self.num_metadata_cols)?;
+            }
+            CursorMode::Knn { pos, .. } => {
+                *pos += 1;
+            }
+        }
         Ok(())
     }
 
     fn eof(&mut self) -> bool {
-        self.pos() >= self.len()
+        match &self.mode {
+            CursorMode::Scan { current, .. } => current.is_none(),
+            CursorMode::Knn { results, pos } => *pos >= results.len(),
+        }
     }
 
     fn column(&mut self, idx: usize, ctx: &ColumnContext) -> Result<()> {
@@ -194,26 +195,32 @@ impl VTabCursor for VectorCursor {
 // Helpers duplicated here to avoid circular imports (mirror mod.rs helpers)
 // ---------------------------------------------------------------------------
 
-fn scan_all_rows(db: &VTabConnection, config: &VectorTableConfig) -> Result<Vec<ScanRow>> {
-    let sql = ShadowOps::select_all_data_sql(&config.table_name);
-    let num_meta = config.metadata_columns.len();
-    let mut stmt = db.prepare(&sql)?;
-    stmt.query(())?;
-    let mut rows = Vec::new();
-    while let Some(row) = stmt.next()? {
-        let id = row[0].get_i64();
-        let vector = row[1].get_blob()?.to_vec();
-        let mut metadata = Vec::with_capacity(num_meta);
-        for i in 0..num_meta {
-            metadata.push(row[2 + i].to_owned()?);
-        }
-        rows.push(ScanRow {
-            id,
-            vector,
-            metadata,
-        });
+/// Read a single row out of a live `_data` query result into an owned `ScanRow`.
+/// Shared by the streaming full scan and KNN's per-id lookup.
+fn read_scan_row(row: &mut QueryResult, num_meta: usize) -> Result<ScanRow> {
+    let id = row[0].get_i64();
+    let vector = row[1].get_blob()?.to_vec();
+    let mut metadata = Vec::with_capacity(num_meta);
+    for i in 0..num_meta {
+        metadata.push(row[2 + i].to_owned()?);
     }
-    Ok(rows)
+    Ok(ScanRow {
+        id,
+        vector,
+        metadata,
+    })
+}
+
+/// Advance a `CursorMode::Scan` by one row, reading directly from the live
+/// statement instead of a pre-materialized buffer. No-op for KNN mode.
+fn advance_scan(mode: &mut CursorMode, num_meta: usize) -> Result<()> {
+    if let CursorMode::Scan { stmt, current } = mode {
+        *current = match stmt.next()? {
+            Some(row) => Some(read_scan_row(row, num_meta)?),
+            None => None,
+        };
+    }
+    Ok(())
 }
 
 fn fetch_row_by_id(
@@ -224,19 +231,7 @@ fn fetch_row_by_id(
     use sqlite3_ext::SQLITE_EMPTY;
     let sql = ShadowOps::select_data_sql(&config.table_name);
     let num_meta = config.metadata_columns.len();
-    match db.query_row(&sql, [id], |row| {
-        let id = row[0].get_i64();
-        let vector = row[1].get_blob()?.to_vec();
-        let mut metadata = Vec::with_capacity(num_meta);
-        for i in 0..num_meta {
-            metadata.push(row[2 + i].to_owned()?);
-        }
-        Ok(ScanRow {
-            id,
-            vector,
-            metadata,
-        })
-    }) {
+    match db.query_row(&sql, [id], |row| read_scan_row(row, num_meta)) {
         Ok(row) => Ok(Some(row)),
         Err(ref e) if *e == SQLITE_EMPTY => Ok(None),
         Err(e) => Err(e),

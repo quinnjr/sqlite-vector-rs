@@ -86,3 +86,27 @@ fn vector_sync_index_persists_graph_and_state() {
     let v: serde_json::Value = serde_json::from_str(&state).unwrap();
     assert_eq!(v["row_count"], 1);
 }
+
+#[test]
+fn full_scan_streams_all_rows_in_order() {
+    let conn = open_with_extension();
+    conn.execute_batch("CREATE VIRTUAL TABLE s USING vector(dim=2, type=float4, metric=l2);")
+        .unwrap();
+    for i in 0..200 {
+        conn.execute(
+            "INSERT INTO s(vector) VALUES (vector_from_json(?1, 'float4'))",
+            [format!("[{i}.0, 0.0]")],
+        )
+        .unwrap();
+    }
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM s")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids.len(), 200);
+    assert_eq!(ids.first(), Some(&1));
+    assert_eq!(ids.last(), Some(&200));
+}

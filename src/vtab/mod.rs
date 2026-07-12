@@ -456,8 +456,10 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
 
     fn open(&'vtab self) -> Result<Self::Cursor> {
         Ok(VectorCursor {
-            mode: CursorMode::Scan {
-                rows: Vec::new(),
+            // Placeholder — filter() always runs before any row is read and
+            // replaces this with the real Scan or Knn mode.
+            mode: CursorMode::Knn {
+                results: Vec::new(),
                 pos: 0,
             },
             num_metadata_cols: self.config.metadata_columns.len(),
