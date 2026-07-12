@@ -181,13 +181,8 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
             };
             let db = ctx.db();
 
-            let meta_json = db.query_row(
-                &ShadowOps::select_index_sql(&table_name),
-                ["meta"],
-                |row| Ok(row[0].get_str()?.to_owned()),
-            )?;
-            let meta: serde_json::Value =
-                serde_json::from_str(&meta_json).map_err(|e| Error::Module(e.to_string()))?;
+            let meta = crate::vtab::load_meta_from_shadow(db, &table_name)?
+                .ok_or_else(|| Error::Module(format!("no vector table named {table_name}")))?;
             if meta["mode"].as_str() == Some("exact") {
                 return Err(Error::Module(format!(
                     "table '{table_name}' uses mode=exact and has no index"
@@ -407,13 +402,10 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
                 // persisted meta consistent (both unchanged) rather than
                 // diverging.
                 let db = ctx.db();
-                let meta_json = db.query_row(
-                    &ShadowOps::select_index_sql(&config.table_name),
-                    ["meta"],
-                    |row| Ok(row[0].get_str()?.to_owned()),
-                )?;
-                let mut meta: serde_json::Value =
-                    serde_json::from_str(&meta_json).map_err(|e| Error::Module(e.to_string()))?;
+                let mut meta = crate::vtab::load_meta_from_shadow(db, &config.table_name)?
+                    .ok_or_else(|| {
+                        Error::Module(format!("no vector table named {}", config.table_name))
+                    })?;
                 meta["ef_search"] = serde_json::json!(n);
                 db.insert(&ShadowOps::upsert_index_sql(&config.table_name), |stmt: &mut query::Statement| {
                     "meta".bind_param(&mut *stmt, 1)?;

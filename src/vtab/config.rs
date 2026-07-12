@@ -180,10 +180,20 @@ impl VectorTableConfig {
                 .ok_or_else(|| ConfigError("meta missing metric".into()))?,
         )
         .map_err(|e| ConfigError(e.to_string()))?;
+        let m = meta["m"]
+            .as_u64()
+            .ok_or_else(|| ConfigError("meta missing m".into()))? as usize;
+        let ef_construction = meta["ef_construction"]
+            .as_u64()
+            .ok_or_else(|| ConfigError("meta missing ef_construction".into()))?
+            as usize;
+        let ef_search = meta["ef_search"]
+            .as_u64()
+            .ok_or_else(|| ConfigError("meta missing ef_search".into()))? as usize;
         let params = HnswParams {
-            m: meta["m"].as_u64().unwrap_or(16) as usize,
-            ef_construction: meta["ef_construction"].as_u64().unwrap_or(200) as usize,
-            ef_search: meta["ef_search"].as_u64().unwrap_or(64) as usize,
+            m,
+            ef_construction,
+            ef_search,
         };
         Ok((dim, vtype, metric, params))
     }

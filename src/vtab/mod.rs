@@ -104,9 +104,12 @@ fn save_meta_to_shadow(db: &VTabConnection, table_name: &str, meta_json: &str) -
     Ok(())
 }
 
-/// Load the persisted config `meta` row from the `_index` shadow table, if present.
-fn load_meta_from_shadow(
-    db: &VTabConnection,
+/// Load the persisted config `meta` row from the `_index` shadow table, if
+/// present. Shared by `init()` (connect-time verification), and by the
+/// `vector_rebuild_index`/`vector_ef_search` scalar functions in
+/// `src/scalar.rs` — do not duplicate this select+parse elsewhere.
+pub(crate) fn load_meta_from_shadow(
+    db: &sqlite3_ext::Connection,
     table_name: &str,
 ) -> Result<Option<serde_json::Value>> {
     let sql = ShadowOps::select_index_sql(table_name);
