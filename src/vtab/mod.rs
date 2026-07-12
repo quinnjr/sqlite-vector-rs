@@ -91,18 +91,25 @@ fn delete_from_data_shadow(db: &VTabConnection, table_name: &str, rowid: i64) ->
     Ok(())
 }
 
-/// Update an existing row in `_data` by deleting and re-inserting.
-fn update_data_shadow(
+/// Fetch a row from `_data` by rowid, returning (id, vector) or None if not found.
+fn fetch_row_from_shadow(
     db: &VTabConnection,
     config: &VectorTableConfig,
     rowid: i64,
-    vector_blob: &[u8],
-    metadata_args: &mut [&mut ValueRef],
-) -> Result<()> {
-    delete_from_data_shadow(db, &config.table_name, rowid)?;
-    insert_into_data_shadow(db, config, vector_blob, metadata_args)?;
-    Ok(())
+) -> Result<Option<(i64, Vec<u8>)>> {
+    use sqlite3_ext::SQLITE_EMPTY;
+    let sql = ShadowOps::select_data_sql(&config.table_name);
+    match db.query_row(&sql, [rowid], |row| {
+        let id = row[0].get_i64();
+        let vector = row[1].get_blob()?.to_vec();
+        Ok((id, vector))
+    }) {
+        Ok(pair) => Ok(Some(pair)),
+        Err(ref e) if *e == SQLITE_EMPTY => Ok(None),
+        Err(e) => Err(e),
+    }
 }
+
 
 // ---------------------------------------------------------------------------
 // Shared init logic used by both connect and create
@@ -328,29 +335,62 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 Ok(rowid)
             }
             ChangeType::Update => {
-                let rowid = info.rowid().get_i64();
+                use sqlite3_ext::query::Statement;
+                let old_rowid = info.rowid().get_i64();
                 let args = info.args_mut();
-                // args[0] = new rowid, args[1] = id col, args[2] = vector, args[3+N] = distance
-                let vector_blob = args[2].get_blob()?.to_vec();
+                // args[0] = new rowid (NULL when unchanged), args[1] = id col value,
+                // args[2] = vector, args[3..3+N] = metadata columns.
+                // Always use args[1] (the id column value) as the authoritative source
+                let new_rowid = if !args[1].is_null() {
+                    args[1].get_i64()
+                } else {
+                    old_rowid
+                };
+                // If vector is NULL (not being updated), fetch the old vector from the database
+                let vector_blob = if args[2].is_null() {
+                    match fetch_row_from_shadow(db, &self.config, old_rowid)? {
+                        Some(row) => row.1,
+                        None => return Err(Error::Module(
+                            format!("Row {} not found in shadow table", old_rowid),
+                        )),
+                    }
+                } else {
+                    args[2].get_blob()?.to_vec()
+                };
                 let num_meta = self.config.metadata_columns.len();
+
+                self.config
+                    .vtype
+                    .validate_finite(&vector_blob, self.config.dim)
+                    .map_err(|e| Error::Module(e.to_string()))?;
+
                 let meta_args = &mut args[3..3 + num_meta];
+                let sql = ShadowOps::update_data_sql(&self.config);
+                db.execute(&sql, |stmt: &mut Statement| {
+                    new_rowid.bind_param(&mut *stmt, 1)?;
+                    vector_blob.as_slice().bind_param(&mut *stmt, 2)?;
+                    let mut i = 3;
+                    for val in meta_args.iter_mut() {
+                        val.bind_param(&mut *stmt, i)?;
+                        i += 1;
+                    }
+                    old_rowid.bind_param(&mut *stmt, i)?;
+                    Ok(())
+                })?;
 
-                update_data_shadow(db, &self.config, rowid, &vector_blob, meta_args)?;
-
-                // Update index: remove old entry, add new one
                 let state = self.state.borrow();
                 state
                     .index
-                    .remove(rowid as u64)
+                    .remove(old_rowid as u64)
                     .map_err(|e| Error::Module(e.to_string()))?;
                 state
                     .index
-                    .add(rowid as u64, &vector_blob)
+                    .add(new_rowid as u64, &vector_blob)
                     .map_err(|e| Error::Module(e.to_string()))?;
                 drop(state);
                 self.state.borrow_mut().dirty = true;
 
-                Ok(rowid)
+                Ok(new_rowid)
             }
         }
     }

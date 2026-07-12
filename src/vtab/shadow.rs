@@ -52,6 +52,18 @@ impl ShadowOps {
         format!("INSERT INTO \"{table_name}_data\"(vector) VALUES(?)")
     }
 
+    pub fn update_data_sql(config: &VectorTableConfig) -> String {
+        let mut sets = vec!["id = ?".to_string(), "vector = ?".to_string()];
+        for (name, _) in &config.metadata_columns {
+            sets.push(format!("{name} = ?"));
+        }
+        format!(
+            "UPDATE \"{}_data\" SET {} WHERE id = ?",
+            config.table_name,
+            sets.join(", ")
+        )
+    }
+
     pub fn delete_data_sql(table_name: &str) -> String {
         format!("DELETE FROM \"{table_name}_data\" WHERE id = ?")
     }
