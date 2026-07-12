@@ -16,8 +16,7 @@ pub struct IndexState {
     pub dirty: bool,
     pub last_committed: Option<Vec<u8>>,
     pub changes_since_persist: u64,
-    /// Set by Update/Delete (never by plain Insert — see Finding 1 in the
-    /// post-review fix wave): tracks whether a destructive change to an
+    /// Set by Update/Delete (never by plain Insert): tracks whether a destructive change to an
     /// *existing* graph key happened since the last persist. Reconcile-on-
     /// connect only detects rows missing from the graph (`!index.contains`)
     /// or a `len() != count` mismatch; it cannot detect a key that's present
@@ -52,7 +51,7 @@ unsafe impl Sync for VectorTransaction {}
 /// function (which supplies `ctx.db()`, a `&Connection`, rather than the
 /// `&VTabConnection` the vtab path has — both deref to the same `Connection`
 /// in sqlite3_ext 0.2).
-pub fn persist_index(db: &Connection, table_name: &str, s: &mut IndexState) -> Result<()> {
+pub(crate) fn persist_index(db: &Connection, table_name: &str, s: &mut IndexState) -> Result<()> {
     use sqlite3_ext::query::Statement;
     let Some(index) = &s.index else {
         // Exact mode: no HNSW graph to persist.
@@ -134,8 +133,7 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
             // `reconcile_index` doesn't currently report a count, so we
             // conservatively reset to 0 here and let the existing
             // `sync_every`/dirty-tracking on subsequent mutations (or a
-            // future explicit `vector_sync_index`) catch up. This matches
-            // the "reset to 0" fallback called out in the review finding.
+            // future explicit `vector_sync_index`) catch up.
             s.changes_since_persist = 0;
             s.destructive_since_persist = false;
         }

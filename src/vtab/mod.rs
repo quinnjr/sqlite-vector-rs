@@ -27,7 +27,7 @@ const INDEX_SCAN: i32 = 0;
 const INDEX_KNN: i32 = 1;
 
 /// Default ANN candidate count when no LIMIT is safely consumable as k.
-pub const DEFAULT_KNN_K: usize = 100;
+pub(crate) const DEFAULT_KNN_K: usize = 100;
 
 /// Shadow-table SQL strings built once per table (at connect/create time)
 /// instead of `format!`-ed on every operation. `update` is intentionally
@@ -35,17 +35,17 @@ pub const DEFAULT_KNN_K: usize = 100;
 /// columns actually changed (id/vector/metadata), so it cannot be
 /// prebuilt — the `Update` arm of `UpdateVTab::update` still calls
 /// `ShadowOps::update_data_sql` directly.
-pub struct TableSql {
-    pub insert: String,
-    pub insert_with_id: String,
-    pub delete: String,
-    pub fetch_by_id: String,
-    pub scan_all: String,
-    pub ids_vectors: String,
+pub(crate) struct TableSql {
+    pub(crate) insert: String,
+    pub(crate) insert_with_id: String,
+    pub(crate) delete: String,
+    pub(crate) fetch_by_id: String,
+    pub(crate) scan_all: String,
+    pub(crate) ids_vectors: String,
 }
 
 impl TableSql {
-    pub fn new(config: &VectorTableConfig) -> Self {
+    pub(crate) fn new(config: &VectorTableConfig) -> Self {
         Self {
             insert: ShadowOps::insert_data_sql(config),
             insert_with_id: ShadowOps::insert_data_with_id_sql(config),
@@ -71,7 +71,7 @@ pub struct VectorTable<'vtab> {
     functions: VTabFunctionList<'vtab, Self>,
     /// Cloned handle to the same registry the table registered itself in at
     /// connect/create time. `disconnect()` doesn't receive `Aux`, so this is
-    /// how it can remove its own entry (see Finding 1).
+    /// how it can remove its own entry.
     registry: Registry,
     /// Cached prepared statements for the `xUpdate` paths (spec 2.3): insert,
     /// insert-with-explicit-id, delete-by-rowid, fetch-by-id. `Statement` is
@@ -211,16 +211,16 @@ fn fetch_row_from_shadow(stmt: &mut Statement, rowid: i64) -> Result<Option<(i64
 // connection, keyed by table name.
 // ---------------------------------------------------------------------------
 
-pub struct RegistryEntry {
-    pub state: Weak<RefCell<IndexState>>,
-    pub config: VectorTableConfig,
+pub(crate) struct RegistryEntry {
+    pub(crate) state: Weak<RefCell<IndexState>>,
+    pub(crate) config: VectorTableConfig,
 }
 
 /// Shared between the vtab module and the scalar functions on one connection.
 /// SQLite serializes all access on a connection; the Mutex satisfies Send
 /// bounds, and the unsafe impls mirror VectorTable's single-thread invariant.
 #[derive(Clone, Default)]
-pub struct Registry(pub Arc<Mutex<HashMap<String, RegistryEntry>>>);
+pub struct Registry(pub(crate) Arc<Mutex<HashMap<String, RegistryEntry>>>);
 unsafe impl Send for Registry {}
 unsafe impl Sync for Registry {}
 
@@ -245,9 +245,9 @@ impl Registry {
     /// Remove the exact `db.table` entry, if present. Called from both
     /// `destroy()` (DROP TABLE) and the vtab's `disconnect()` path so dead
     /// entries never linger to participate in bare-name suffix matching
-    /// (see Finding 1: a dropped `main.t` must not make a freshly created
-    /// `aux.t` look "ambiguous" under the bare name `t`) and so long-lived
-    /// connections don't grow the map unboundedly.
+    /// (a dropped `main.t` must not make a freshly created `aux.t` look
+    /// "ambiguous" under the bare name `t`) and so long-lived connections
+    /// don't grow the map unboundedly.
     pub fn unregister(&self, db_name: &str, table_name: &str) {
         let key = format!("{db_name}.{table_name}");
         self.0.lock().unwrap().remove(&key);
@@ -311,6 +311,20 @@ impl Registry {
     }
 }
 
+/// Map a constraint op to the wire token used in `best_index`'s filter spec
+/// and argv-assignment passes. Kept as a single source of truth so the two
+/// passes can never drift out of sync with each other.
+fn op_token(op: ConstraintOp) -> Option<&'static str> {
+    match op {
+        ConstraintOp::Eq => Some("eq"),
+        ConstraintOp::GT => Some("gt"),
+        ConstraintOp::GE => Some("ge"),
+        ConstraintOp::LT => Some("lt"),
+        ConstraintOp::LE => Some("le"),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reconcile: bring an in-memory HNSW index up to date with the `_data` shadow
 // table after a fresh connect (or a rollback). Adds rows present in `_data`
@@ -318,7 +332,7 @@ impl Registry {
 // that were never persisted), rebuilds it from scratch.
 // ---------------------------------------------------------------------------
 
-pub fn reconcile_index(
+pub(crate) fn reconcile_index(
     db: &VTabConnection,
     config: &VectorTableConfig,
     index: HnswIndex,
@@ -337,9 +351,12 @@ pub fn reconcile_index(
         let id = row[0].get_i64();
         let vector = row[1].get_blob()?.to_vec();
         if !index.contains(id as u64) {
-            index
-                .add(id as u64, &vector)
-                .map_err(|e| Error::Module(e.to_string()))?;
+            index.add(id as u64, &vector).map_err(|e| {
+                Error::Module(format!(
+                    "reconcile of vector table '{}' failed: {e}",
+                    config.table_name
+                ))
+            })?;
         }
         rows.push((id, vector));
     }
@@ -357,9 +374,12 @@ pub fn reconcile_index(
     )
     .map_err(|e| Error::Module(e.to_string()))?;
     for (id, vector) in &rows {
-        fresh
-            .add(*id as u64, vector)
-            .map_err(|e| Error::Module(e.to_string()))?;
+        fresh.add(*id as u64, vector).map_err(|e| {
+            Error::Module(format!(
+                "reconcile of vector table '{}' failed: {e}",
+                config.table_name
+            ))
+        })?;
     }
     Ok(fresh)
 }
@@ -543,14 +563,7 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
             } else if matches!(c.op(), ConstraintOp::Offset) {
                 // Offset is neither pushed nor blocking on its own.
             } else if c.column() >= 2 && c.column() < 2 + n_meta {
-                let op = match c.op() {
-                    ConstraintOp::Eq => Some("eq"),
-                    ConstraintOp::GT => Some("gt"),
-                    ConstraintOp::GE => Some("ge"),
-                    ConstraintOp::LT => Some("lt"),
-                    ConstraintOp::LE => Some("le"),
-                    _ => None,
-                };
+                let op = op_token(c.op());
                 match op {
                     Some(op) => filters.push((c.column(), op)),
                     None => has_other = true,
@@ -622,13 +635,8 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
                 if used.contains(&pos) || !c.usable() || c.column() != *filter_col {
                     continue;
                 }
-                let op = match c.op() {
-                    ConstraintOp::Eq => "eq",
-                    ConstraintOp::GT => "gt",
-                    ConstraintOp::GE => "ge",
-                    ConstraintOp::LT => "lt",
-                    ConstraintOp::LE => "le",
-                    _ => continue,
+                let Some(op) = op_token(c.op()) else {
+                    continue;
                 };
                 if op == *filter_op {
                     c.set_argv_index(Some(argv_next - 1));
@@ -685,7 +693,7 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
         // Mirror of connect()/build_vtab's `aux.register(...)`: this is the
         // normal (non-DROP) teardown path — closing the connection, or
         // SQLite reloading the schema — and must remove the same registry
-        // entry so it doesn't linger as a dead Weak (see Finding 1).
+        // entry so it doesn't linger as a dead Weak.
         self.registry
             .unregister(&self.config.db_name, &self.config.table_name);
         Ok(())
@@ -760,7 +768,7 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                         // Deletes remove an existing graph key; reconcile-on-
                         // connect only re-adds keys that are *missing*, so an
                         // unpersisted delete must be forced out eagerly (see
-                        // Finding 1, IndexState::destructive_since_persist).
+                        // IndexState::destructive_since_persist).
                         s.destructive_since_persist = true;
                     }
                 }
@@ -840,8 +848,8 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 //
                 // `ValueRef::nochange()` is the correct discriminator between "column
                 // untouched by this UPDATE" and "user explicitly set it" (see
-                // sqlite3_value_nochange). Empirically (see task-1-report.md, Fix round
-                // 1) this vtab's cursor never opts into the nochange optimization, so
+                // sqlite3_value_nochange). Empirically, this vtab's cursor never
+                // opts into the nochange optimization, so
                 // nochange() is always false and SQLite backfills untouched columns
                 // with their real old values instead of NULL/nochange sentinels. We
                 // still branch on nochange() here: if it is false (the observed case)
@@ -955,8 +963,7 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                             // An UPDATE re-keys/re-embeds an existing graph
                             // entry in place; `index.contains(id)` stays true
                             // so reconcile-on-connect would skip it and serve
-                            // the stale embedding. Force an eager persist
-                            // (see Finding 1).
+                            // the stale embedding. Force an eager persist.
                             s.destructive_since_persist = true;
                         }
                     }
