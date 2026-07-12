@@ -52,6 +52,39 @@ fn f64s_to_blob(values: &[f64], vtype: VectorType) -> Vec<u8> {
     }
 }
 
+/// Register a binary elementwise vector scalar function `name(a, b, type) ->
+/// BLOB` that decodes both operands to f64 lanes, checks their dimensions
+/// match, combines each lane pair with `op`, and re-encodes the result in
+/// the input element type. Shared by `vector_add` and `vector_sub`, which
+/// differ only in `op`.
+fn register_binary_elementwise(
+    db: &Connection,
+    name: &str,
+    op: fn(f64, f64) -> f64,
+) -> Result<()> {
+    db.create_scalar_function(
+        name,
+        &FunctionOptions::default()
+            .set_n_args(3)
+            .set_deterministic(true),
+        move |ctx, args| {
+            let type_name = args[2].get_str()?.to_owned();
+            let a = args[0].get_blob()?.to_vec();
+            let b = args[1].get_blob()?.to_vec();
+            let vtype =
+                VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
+            if a.len() != b.len() {
+                return Err(Error::Module("vector dimensions do not match".into()));
+            }
+            let va = blob_to_f64s(&a, vtype);
+            let vb = blob_to_f64s(&b, vtype);
+            let out: Vec<f64> = va.iter().zip(&vb).map(|(x, y)| op(*x, *y)).collect();
+            ctx.set_result(&f64s_to_blob(&out, vtype)[..])?;
+            Ok(())
+        },
+    )
+}
+
 /// Register all standalone scalar functions on a connection.
 pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<()> {
     // vector_distance(blob_a, blob_b, metric, type) -> REAL
@@ -420,9 +453,10 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
                 })?;
 
                 let s = state.borrow();
-                let idx = s.index.as_ref().ok_or_else(|| {
-                    Error::Module(format!("table '{}' uses mode=exact and has no index", table_name))
-                })?;
+                let idx = s
+                    .index
+                    .as_ref()
+                    .expect("index present: checked above under single-thread invariant");
                 idx.set_ef_search(n as usize);
                 drop(s);
 
@@ -509,50 +543,10 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
     )?;
 
     // vector_add(a, b, type) -> BLOB
-    db.create_scalar_function(
-        "vector_add",
-        &FunctionOptions::default()
-            .set_n_args(3)
-            .set_deterministic(true),
-        |ctx, args| {
-            let type_name = args[2].get_str()?.to_owned();
-            let a = args[0].get_blob()?.to_vec();
-            let b = args[1].get_blob()?.to_vec();
-            let vtype =
-                VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
-            if a.len() != b.len() {
-                return Err(Error::Module("vector dimensions do not match".into()));
-            }
-            let va = blob_to_f64s(&a, vtype);
-            let vb = blob_to_f64s(&b, vtype);
-            let out: Vec<f64> = va.iter().zip(&vb).map(|(x, y)| x + y).collect();
-            ctx.set_result(&f64s_to_blob(&out, vtype)[..])?;
-            Ok(())
-        },
-    )?;
+    register_binary_elementwise(db, "vector_add", |x, y| x + y)?;
 
     // vector_sub(a, b, type) -> BLOB
-    db.create_scalar_function(
-        "vector_sub",
-        &FunctionOptions::default()
-            .set_n_args(3)
-            .set_deterministic(true),
-        |ctx, args| {
-            let type_name = args[2].get_str()?.to_owned();
-            let a = args[0].get_blob()?.to_vec();
-            let b = args[1].get_blob()?.to_vec();
-            let vtype =
-                VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
-            if a.len() != b.len() {
-                return Err(Error::Module("vector dimensions do not match".into()));
-            }
-            let va = blob_to_f64s(&a, vtype);
-            let vb = blob_to_f64s(&b, vtype);
-            let out: Vec<f64> = va.iter().zip(&vb).map(|(x, y)| x - y).collect();
-            ctx.set_result(&f64s_to_blob(&out, vtype)[..])?;
-            Ok(())
-        },
-    )?;
+    register_binary_elementwise(db, "vector_sub", |x, y| x - y)?;
 
     // vector_scale(blob, factor, type) -> BLOB
     db.create_scalar_function(
