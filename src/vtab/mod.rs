@@ -447,6 +447,7 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
         // Pass 1: classify. Metadata-column constraints with a supported op
         // become pushable filters instead of forcing has_other.
         let mut has_knn = false;
+        let mut knn_count = 0u32;
         let mut has_limit = false;
         let mut has_other = false;
         let mut filters: Vec<(i32, &'static str)> = Vec::new();
@@ -456,6 +457,7 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
             }
             if c.column() == distance_col && matches!(c.op(), ConstraintOp::Function(_)) {
                 has_knn = true;
+                knn_count += 1;
             } else if matches!(c.op(), ConstraintOp::Limit) {
                 has_limit = true;
             } else if matches!(c.op(), ConstraintOp::Offset) {
@@ -476,6 +478,12 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
             } else {
                 has_other = true;
             }
+        }
+
+        if knn_count > 1 {
+            return Err(Error::Module(
+                "at most one knn_match constraint is supported per query".to_string(),
+            ));
         }
 
         // ORDER BY is consumable iff absent or exactly `distance ASC`.

@@ -579,3 +579,25 @@ fn mid_transaction_sync_then_rollback_recovers() {
         .unwrap();
     assert_eq!(n2, 2, "post-rollback insert must succeed with no duplicate-key error");
 }
+
+#[test]
+fn multiple_knn_match_constraints_are_rejected() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE mk USING vector(dim=2, type=float4, metric=l2);
+         INSERT INTO mk(vector) VALUES (vector_from_json('[0.0, 0.0]', 'float4'));",
+    )
+    .unwrap();
+    let err = conn
+        .prepare(
+            "SELECT id FROM mk
+             WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4'))
+             AND knn_match(distance, vector_from_json('[1.0, 1.0]', 'float4'))",
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("knn_match"),
+        "error message should mention knn_match, got: {msg}"
+    );
+}
