@@ -110,7 +110,6 @@ fn fetch_row_from_shadow(
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Shared init logic used by both connect and create
 // ---------------------------------------------------------------------------
@@ -338,57 +337,121 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 use sqlite3_ext::query::Statement;
                 let old_rowid = info.rowid().get_i64();
                 let args = info.args_mut();
-                // args[0] = new rowid (NULL when unchanged), args[1] = id col value,
-                // args[2] = vector, args[3..3+N] = metadata columns.
-                // Always use args[1] (the id column value) as the authoritative source
-                let new_rowid = if !args[1].is_null() {
-                    args[1].get_i64()
-                } else {
-                    old_rowid
-                };
-                // If vector is NULL (not being updated), fetch the old vector from the database
-                let vector_blob = if args[2].is_null() {
-                    match fetch_row_from_shadow(db, &self.config, old_rowid)? {
-                        Some(row) => row.1,
-                        None => return Err(Error::Module(
-                            format!("Row {} not found in shadow table", old_rowid),
-                        )),
-                    }
-                } else {
-                    args[2].get_blob()?.to_vec()
-                };
                 let num_meta = self.config.metadata_columns.len();
+                // args[0] = new rowid hint, args[1] = id col value, args[2] = vector,
+                // args[3..3+N] = metadata columns.
+                //
+                // `ValueRef::nochange()` is the correct discriminator between "column
+                // untouched by this UPDATE" and "user explicitly set it" (see
+                // sqlite3_value_nochange). Empirically (see task-1-report.md, Fix round
+                // 1) this vtab's cursor never opts into the nochange optimization, so
+                // nochange() is always false and SQLite backfills untouched columns
+                // with their real old values instead of NULL/nochange sentinels. We
+                // still branch on nochange() here: if it is false (the observed case)
+                // this degrades to a full-column UPDATE, which is correct because the
+                // "old" values SQLite supplied are the real unchanged data; if a future
+                // SQLite/cursor change ever makes nochange() true for untouched
+                // columns, this code already does the right thing (skips rebinding
+                // that column and reuses the existing row.)
+                let id_unchanged = args[1].nochange();
+                let new_rowid = if id_unchanged {
+                    old_rowid
+                } else {
+                    args[1].get_i64()
+                };
 
-                self.config
-                    .vtype
-                    .validate_finite(&vector_blob, self.config.dim)
-                    .map_err(|e| Error::Module(e.to_string()))?;
+                let vector_unchanged = args[2].nochange();
+                let vector_blob: Option<Vec<u8>> = if vector_unchanged {
+                    None
+                } else if args[2].is_null() {
+                    // Vector is NOT NULL at the schema level; a genuine (non-nochange)
+                    // NULL means the statement tried to null out the vector column.
+                    return Err(Error::Module(
+                        "vector column cannot be NULL".to_string(),
+                    ));
+                } else {
+                    let blob = args[2].get_blob()?.to_vec();
+                    self.config
+                        .vtype
+                        .validate_finite(&blob, self.config.dim)
+                        .map_err(|e| Error::Module(e.to_string()))?;
+                    Some(blob)
+                };
 
-                let meta_args = &mut args[3..3 + num_meta];
-                let sql = ShadowOps::update_data_sql(&self.config);
-                db.execute(&sql, |stmt: &mut Statement| {
-                    new_rowid.bind_param(&mut *stmt, 1)?;
-                    vector_blob.as_slice().bind_param(&mut *stmt, 2)?;
-                    let mut i = 3;
-                    for val in meta_args.iter_mut() {
-                        val.bind_param(&mut *stmt, i)?;
-                        i += 1;
+                let mut changed_meta_idx = Vec::with_capacity(num_meta);
+                for (i, val) in args[3..3 + num_meta].iter().enumerate() {
+                    if !val.nochange() {
+                        changed_meta_idx.push(i);
                     }
-                    old_rowid.bind_param(&mut *stmt, i)?;
-                    Ok(())
-                })?;
+                }
 
-                let state = self.state.borrow();
-                state
-                    .index
-                    .remove(old_rowid as u64)
-                    .map_err(|e| Error::Module(e.to_string()))?;
-                state
-                    .index
-                    .add(new_rowid as u64, &vector_blob)
-                    .map_err(|e| Error::Module(e.to_string()))?;
-                drop(state);
-                self.state.borrow_mut().dirty = true;
+                let include_id = !id_unchanged;
+                let include_vector = vector_blob.is_some();
+                let rowid_changed = new_rowid != old_rowid;
+                let needs_reindex = rowid_changed || include_vector;
+
+                // If we need to re-key the index but the vector itself isn't
+                // changing, fetch the existing vector BEFORE mutating the shadow
+                // row (once the row's id changes, it's no longer reachable at
+                // old_rowid).
+                let reindex_vector: Option<Vec<u8>> = if needs_reindex && vector_blob.is_none() {
+                    match fetch_row_from_shadow(db, &self.config, old_rowid)? {
+                        Some((_, v)) => Some(v),
+                        None => {
+                            return Err(Error::Module(format!(
+                                "Row {old_rowid} not found in shadow table"
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if include_id || include_vector || !changed_meta_idx.is_empty() {
+                    let sql = ShadowOps::update_data_sql(
+                        &self.config,
+                        include_id,
+                        include_vector,
+                        &changed_meta_idx,
+                    );
+                    let meta_args = &mut args[3..3 + num_meta];
+                    db.execute(&sql, |stmt: &mut Statement| {
+                        let mut pos = 1;
+                        if include_id {
+                            new_rowid.bind_param(&mut *stmt, pos)?;
+                            pos += 1;
+                        }
+                        if let Some(v) = &vector_blob {
+                            v.as_slice().bind_param(&mut *stmt, pos)?;
+                            pos += 1;
+                        }
+                        for (i, val) in meta_args.iter_mut().enumerate() {
+                            if changed_meta_idx.contains(&i) {
+                                val.bind_param(&mut *stmt, pos)?;
+                                pos += 1;
+                            }
+                        }
+                        old_rowid.bind_param(&mut *stmt, pos)?;
+                        Ok(())
+                    })?;
+                }
+
+                if needs_reindex {
+                    let final_vector = vector_blob
+                        .or(reindex_vector)
+                        .expect("vector available for reindex: computed above");
+                    let state = self.state.borrow();
+                    state
+                        .index
+                        .remove(old_rowid as u64)
+                        .map_err(|e| Error::Module(e.to_string()))?;
+                    state
+                        .index
+                        .add(new_rowid as u64, &final_vector)
+                        .map_err(|e| Error::Module(e.to_string()))?;
+                    drop(state);
+                    self.state.borrow_mut().dirty = true;
+                }
 
                 Ok(new_rowid)
             }

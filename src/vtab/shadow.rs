@@ -52,9 +52,29 @@ impl ShadowOps {
         format!("INSERT INTO \"{table_name}_data\"(vector) VALUES(?)")
     }
 
-    pub fn update_data_sql(config: &VectorTableConfig) -> String {
-        let mut sets = vec!["id = ?".to_string(), "vector = ?".to_string()];
-        for (name, _) in &config.metadata_columns {
+    /// Build an `UPDATE "<t>_data" SET ... WHERE id = ?` statement that touches only
+    /// the columns actually changed by the UPDATE:
+    /// - `include_id`: bind `id = ?` (only when the rowid is actually changing)
+    /// - `include_vector`: bind `vector = ?`
+    /// - `changed_meta`: indices into `config.metadata_columns` for changed metadata columns
+    ///
+    /// Bind order matches the SET clause order (id, vector, then metadata in
+    /// `changed_meta` order), followed by the old id for the WHERE clause.
+    pub fn update_data_sql(
+        config: &VectorTableConfig,
+        include_id: bool,
+        include_vector: bool,
+        changed_meta: &[usize],
+    ) -> String {
+        let mut sets = Vec::new();
+        if include_id {
+            sets.push("id = ?".to_string());
+        }
+        if include_vector {
+            sets.push("vector = ?".to_string());
+        }
+        for &i in changed_meta {
+            let (name, _) = &config.metadata_columns[i];
             sets.push(format!("{name} = ?"));
         }
         format!(
@@ -275,6 +295,53 @@ mod tests {
     fn insert_vector_only_sql_exact() {
         let sql = ShadowOps::insert_vector_only_sql("emb");
         assert_eq!(sql, "INSERT INTO \"emb_data\"(vector) VALUES(?)");
+    }
+
+    // --- update_data_sql ---
+
+    #[test]
+    fn update_data_sql_id_and_vector_only_no_metadata() {
+        let sql = ShadowOps::update_data_sql(&base_config(), true, true, &[]);
+        assert_eq!(
+            sql,
+            "UPDATE \"emb_data\" SET id = ?, vector = ? WHERE id = ?"
+        );
+    }
+
+    #[test]
+    fn update_data_sql_vector_only_no_metadata() {
+        let sql = ShadowOps::update_data_sql(&base_config(), false, true, &[]);
+        assert_eq!(sql, "UPDATE \"emb_data\" SET vector = ? WHERE id = ?");
+    }
+
+    #[test]
+    fn update_data_sql_id_only_no_metadata() {
+        let sql = ShadowOps::update_data_sql(&base_config(), true, false, &[]);
+        assert_eq!(sql, "UPDATE \"emb_data\" SET id = ? WHERE id = ?");
+    }
+
+    #[test]
+    fn update_data_sql_vector_and_all_metadata() {
+        let sql = ShadowOps::update_data_sql(&config_with_metadata(), false, true, &[0, 1]);
+        assert_eq!(
+            sql,
+            "UPDATE \"emb_data\" SET vector = ?, label = ?, score = ? WHERE id = ?"
+        );
+    }
+
+    #[test]
+    fn update_data_sql_only_one_metadata_column() {
+        let sql = ShadowOps::update_data_sql(&config_with_metadata(), false, false, &[1]);
+        assert_eq!(sql, "UPDATE \"emb_data\" SET score = ? WHERE id = ?");
+    }
+
+    #[test]
+    fn update_data_sql_id_vector_and_metadata() {
+        let sql = ShadowOps::update_data_sql(&config_with_metadata(), true, true, &[0, 1]);
+        assert_eq!(
+            sql,
+            "UPDATE \"emb_data\" SET id = ?, vector = ?, label = ?, score = ? WHERE id = ?"
+        );
     }
 
     // --- delete_data_sql ---
