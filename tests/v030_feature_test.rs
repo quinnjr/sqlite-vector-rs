@@ -180,3 +180,21 @@ fn filtered_knn_returns_full_limit_beyond_default_k() {
         .unwrap();
     assert_eq!(ids.len(), 3, "oversampling must reach past the crowd of 'b' rows");
 }
+
+#[test]
+fn knn_limit_zero_returns_no_rows() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE lz USING vector(dim=2, type=float4, metric=l2);
+         INSERT INTO lz(vector) VALUES (vector_from_json('[1.0, 0.0]', 'float4'));",
+    )
+    .unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM (SELECT id FROM lz WHERE knn_match(distance, vector_from_json('[1.0, 0.0]', 'float4')) LIMIT 0)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "LIMIT 0 must return no rows");
+}
