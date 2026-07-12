@@ -1,10 +1,9 @@
 use std::fmt;
 
-use bytemuck::cast_slice;
 use half::f16;
 
 use crate::distance::{DistanceMetric, vtype_to_scalar_kind};
-use crate::types::VectorType;
+use crate::types::{VectorType, cast_blob};
 
 /// Optional HNSW tuning parameters.
 #[derive(Debug, Clone, Copy)]
@@ -82,41 +81,41 @@ impl HnswIndex {
         self.reserve_if_needed()?;
         match self.vtype {
             VectorType::Float4 => {
-                let v: &[f32] = cast_slice(blob);
+                let v = cast_blob::<f32>(blob);
                 self.inner
-                    .add(key, v)
+                    .add(key, &v[..])
                     .map_err(|e| IndexError(e.to_string()))
             }
             VectorType::Float8 => {
-                let v: &[f64] = cast_slice(blob);
+                let v = cast_blob::<f64>(blob);
                 self.inner
-                    .add(key, v)
+                    .add(key, &v[..])
                     .map_err(|e| IndexError(e.to_string()))
             }
             VectorType::Int1 => {
-                let v: &[i8] = cast_slice(blob);
+                let v = cast_blob::<i8>(blob);
                 self.inner
-                    .add(key, v)
+                    .add(key, &v[..])
                     .map_err(|e| IndexError(e.to_string()))
             }
             // Float2 (f16), Int2 (i16), Int4 (i32) are not natively supported by the usearch
             // generic VectorType trait as half::f16 — convert to f32 for index operations.
             VectorType::Float2 => {
-                let v: &[f16] = cast_slice(blob);
+                let v = cast_blob::<f16>(blob);
                 let f: Vec<f32> = v.iter().map(|x| x.to_f32()).collect();
                 self.inner
                     .add(key, &f)
                     .map_err(|e| IndexError(e.to_string()))
             }
             VectorType::Int2 => {
-                let v: &[i16] = cast_slice(blob);
+                let v = cast_blob::<i16>(blob);
                 let f: Vec<f32> = v.iter().map(|x| *x as f32).collect();
                 self.inner
                     .add(key, &f)
                     .map_err(|e| IndexError(e.to_string()))
             }
             VectorType::Int4 => {
-                let v: &[i32] = cast_slice(blob);
+                let v = cast_blob::<i32>(blob);
                 let f: Vec<f32> = v.iter().map(|x| *x as f32).collect();
                 self.inner
                     .add(key, &f)
@@ -134,29 +133,29 @@ impl HnswIndex {
 
         let matches = match self.vtype {
             VectorType::Float4 => {
-                let q: &[f32] = cast_slice(query_blob);
-                self.inner.search(q, k)
+                let q = cast_blob::<f32>(query_blob);
+                self.inner.search(&q[..], k)
             }
             VectorType::Float8 => {
-                let q: &[f64] = cast_slice(query_blob);
-                self.inner.search(q, k)
+                let q = cast_blob::<f64>(query_blob);
+                self.inner.search(&q[..], k)
             }
             VectorType::Int1 => {
-                let q: &[i8] = cast_slice(query_blob);
-                self.inner.search(q, k)
+                let q = cast_blob::<i8>(query_blob);
+                self.inner.search(&q[..], k)
             }
             VectorType::Float2 => {
-                let q: &[f16] = cast_slice(query_blob);
+                let q = cast_blob::<f16>(query_blob);
                 let f: Vec<f32> = q.iter().map(|x| x.to_f32()).collect();
                 self.inner.search(&f, k)
             }
             VectorType::Int2 => {
-                let q: &[i16] = cast_slice(query_blob);
+                let q = cast_blob::<i16>(query_blob);
                 let f: Vec<f32> = q.iter().map(|x| *x as f32).collect();
                 self.inner.search(&f, k)
             }
             VectorType::Int4 => {
-                let q: &[i32] = cast_slice(query_blob);
+                let q = cast_blob::<i32>(query_blob);
                 let f: Vec<f32> = q.iter().map(|x| *x as f32).collect();
                 self.inner.search(&f, k)
             }

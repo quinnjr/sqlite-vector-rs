@@ -3,7 +3,7 @@ use std::fmt;
 use half::f16;
 use serde_json::Value;
 
-use crate::types::{VectorType, VectorTypeError};
+use crate::types::{VectorType, VectorTypeError, cast_blob};
 
 /// Errors from JSON conversion.
 #[derive(Debug)]
@@ -98,27 +98,27 @@ pub fn json_to_blob(json: &str, vtype: VectorType) -> Result<Vec<u8>, JsonError>
 pub fn blob_to_json(blob: &[u8], vtype: VectorType) -> Result<String, JsonError> {
     let values: Vec<Value> = match vtype {
         VectorType::Float2 => {
-            let s: &[f16] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<f16>(blob);
             s.iter().map(|v| Value::from(v.to_f64())).collect()
         }
         VectorType::Float4 => {
-            let s: &[f32] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<f32>(blob);
             s.iter().map(|v| Value::from(*v)).collect()
         }
         VectorType::Float8 => {
-            let s: &[f64] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<f64>(blob);
             s.iter().map(|v| Value::from(*v)).collect()
         }
         VectorType::Int1 => {
-            let s: &[i8] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<i8>(blob);
             s.iter().map(|v| Value::from(*v as i64)).collect()
         }
         VectorType::Int2 => {
-            let s: &[i16] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<i16>(blob);
             s.iter().map(|v| Value::from(*v as i64)).collect()
         }
         VectorType::Int4 => {
-            let s: &[i32] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<i32>(blob);
             s.iter().map(|v| Value::from(*v as i64)).collect()
         }
     };

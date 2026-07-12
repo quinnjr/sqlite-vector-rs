@@ -1,6 +1,7 @@
+use std::borrow::Cow;
 use std::fmt;
 
-use bytemuck::{Pod, cast_slice};
+use bytemuck::{Pod, cast_slice, pod_read_unaligned};
 use half::f16;
 
 /// Errors from vector type operations.
@@ -24,6 +25,21 @@ impl fmt::Display for VectorTypeError {
 }
 
 impl std::error::Error for VectorTypeError {}
+
+/// Cast a byte blob to a typed slice, tolerating misaligned input.
+///
+/// SQLite blob pointers and `Vec<u8>` buffers are not guaranteed to be
+/// aligned for T; fall back to an owned copy when they are not.
+pub fn cast_blob<T: Pod>(blob: &[u8]) -> Cow<'_, [T]> {
+    match bytemuck::try_cast_slice::<u8, T>(blob) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(
+            blob.chunks_exact(std::mem::size_of::<T>())
+                .map(pod_read_unaligned)
+                .collect(),
+        ),
+    }
+}
 
 /// Supported vector element types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,19 +102,19 @@ impl VectorType {
         self.validate_blob(blob, dim)?;
         match self {
             Self::Float2 => {
-                let values: &[f16] = cast_slice(blob);
+                let values = cast_blob::<f16>(blob);
                 if values.iter().any(|v| !v.is_finite()) {
                     return Err(VectorTypeError::NonFiniteValue);
                 }
             }
             Self::Float4 => {
-                let values: &[f32] = cast_slice(blob);
+                let values = cast_blob::<f32>(blob);
                 if values.iter().any(|v| !v.is_finite()) {
                     return Err(VectorTypeError::NonFiniteValue);
                 }
             }
             Self::Float8 => {
-                let values: &[f64] = cast_slice(blob);
+                let values = cast_blob::<f64>(blob);
                 if values.iter().any(|v| !v.is_finite()) {
                     return Err(VectorTypeError::NonFiniteValue);
                 }
@@ -446,5 +462,15 @@ mod tests {
         let expected: &[u8] = cast_slice(&values);
         let got = VectorType::Float4.slice_to_blob(&values);
         assert_eq!(got.as_slice(), expected);
+    }
+
+    #[test]
+    fn cast_blob_handles_misaligned_input() {
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut padded = vec![0u8];
+        padded.extend_from_slice(cast_slice(&values));
+        let misaligned = &padded[1..]; // guaranteed misaligned for f32 (alloc + 1)
+        let out: std::borrow::Cow<'_, [f32]> = cast_blob(misaligned);
+        assert_eq!(out.as_ref(), values.as_slice());
     }
 }

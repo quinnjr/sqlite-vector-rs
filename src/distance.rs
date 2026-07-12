@@ -1,9 +1,8 @@
 use std::fmt;
 
-use bytemuck::cast_slice;
 use half::f16;
 
-use crate::types::VectorType;
+use crate::types::{VectorType, cast_blob};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistanceMetric {
@@ -78,39 +77,39 @@ pub fn compute_distance(
 
     match vtype {
         VectorType::Float4 => {
-            let va: &[f32] = cast_slice(a);
-            let vb: &[f32] = cast_slice(b);
-            Ok(scalar_distance(va, vb, metric))
+            let va = cast_blob::<f32>(a);
+            let vb = cast_blob::<f32>(b);
+            Ok(scalar_distance(&va[..], &vb[..], metric))
         }
         VectorType::Float8 => {
-            let va: &[f64] = cast_slice(a);
-            let vb: &[f64] = cast_slice(b);
-            Ok(scalar_distance_f64(va, vb, metric))
+            let va = cast_blob::<f64>(a);
+            let vb = cast_blob::<f64>(b);
+            Ok(scalar_distance_f64(&va[..], &vb[..], metric))
         }
         VectorType::Float2 => {
-            let va: &[f16] = cast_slice(a);
-            let vb: &[f16] = cast_slice(b);
+            let va = cast_blob::<f16>(a);
+            let vb = cast_blob::<f16>(b);
             let fa: Vec<f32> = va.iter().map(|v| v.to_f32()).collect();
             let fb: Vec<f32> = vb.iter().map(|v| v.to_f32()).collect();
             Ok(scalar_distance(&fa, &fb, metric))
         }
         VectorType::Int1 => {
-            let va: &[i8] = cast_slice(a);
-            let vb: &[i8] = cast_slice(b);
+            let va = cast_blob::<i8>(a);
+            let vb = cast_blob::<i8>(b);
             let fa: Vec<f32> = va.iter().map(|v| *v as f32).collect();
             let fb: Vec<f32> = vb.iter().map(|v| *v as f32).collect();
             Ok(scalar_distance(&fa, &fb, metric))
         }
         VectorType::Int2 => {
-            let va: &[i16] = cast_slice(a);
-            let vb: &[i16] = cast_slice(b);
+            let va = cast_blob::<i16>(a);
+            let vb = cast_blob::<i16>(b);
             let fa: Vec<f32> = va.iter().map(|v| *v as f32).collect();
             let fb: Vec<f32> = vb.iter().map(|v| *v as f32).collect();
             Ok(scalar_distance(&fa, &fb, metric))
         }
         VectorType::Int4 => {
-            let va: &[i32] = cast_slice(a);
-            let vb: &[i32] = cast_slice(b);
+            let va = cast_blob::<i32>(a);
+            let vb = cast_blob::<i32>(b);
             let fa: Vec<f32> = va.iter().map(|v| *v as f32).collect();
             let fb: Vec<f32> = vb.iter().map(|v| *v as f32).collect();
             Ok(scalar_distance(&fa, &fb, metric))

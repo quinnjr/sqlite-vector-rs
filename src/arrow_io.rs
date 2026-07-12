@@ -7,7 +7,7 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 
-use crate::types::VectorType;
+use crate::types::{VectorType, cast_blob};
 
 #[derive(Debug)]
 pub struct ArrowError(pub String);
@@ -105,23 +105,23 @@ fn build_values_array(
         VectorType::Float4 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[f32] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<f32>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Float32, Arc::new(Float32Array::from(flat))))
         }
         VectorType::Float8 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[f64] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<f64>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Float64, Arc::new(Float64Array::from(flat))))
         }
         VectorType::Float2 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[half::f16] = vtype.blob_to_slice(blob);
+                let v = cast_blob::<half::f16>(blob);
                 flat.extend(v.iter().copied());
             }
             Ok((DataType::Float16, Arc::new(Float16Array::from(flat))))
@@ -129,24 +129,24 @@ fn build_values_array(
         VectorType::Int1 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[i8] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<i8>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Int8, Arc::new(Int8Array::from(flat))))
         }
         VectorType::Int2 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[i16] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<i16>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Int16, Arc::new(Int16Array::from(flat))))
         }
         VectorType::Int4 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[i32] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<i32>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Int32, Arc::new(Int32Array::from(flat))))
         }
