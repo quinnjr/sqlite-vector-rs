@@ -326,6 +326,37 @@ fn rebuild_index_one_arg_uses_persisted_config() {
     let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
     assert_eq!(v["metric"], "cosine");
     assert_eq!(v["m"], 8);
+
+    // Finding 2: a "main."-qualified name must resolve the same way a bare
+    // name does — vector_rebuild_index is consistent with the other table
+    // functions (vector_sync_index, vector_ef_search, vector_index_info)
+    // even though it's not documented to support attached databases.
+    let n2: i64 = conn
+        .query_row("SELECT vector_rebuild_index('main.r')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n2, 2);
+}
+
+#[test]
+fn rebuild_index_rejects_non_main_qualified_name() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "ATTACH ':memory:' AS aux;
+         CREATE VIRTUAL TABLE aux.r2 USING vector(dim=2, type=float4, metric=l2);
+         INSERT INTO aux.r2(vector) VALUES (vector_from_json('[1.0, 0.0]', 'float4'));",
+    )
+    .unwrap();
+
+    let err = conn
+        .query_row("SELECT vector_rebuild_index('aux.r2')", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("attached database") && msg.contains("aux"),
+        "expected an attached-database rejection, got: {msg}"
+    );
 }
 
 #[test]

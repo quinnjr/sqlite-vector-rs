@@ -161,7 +161,24 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
         "vector_rebuild_index",
         &FunctionOptions::default().set_n_args(1),
         |ctx, args| {
-            let table_name = args[0].get_str()?.to_owned();
+            let raw_arg = args[0].get_str()?.to_owned();
+            // vector_rebuild_index is documented as bare-name only, but the
+            // other table functions (vector_sync_index, vector_ef_search,
+            // vector_index_info) all accept a `main.`-qualified name, so
+            // accept the same prefix here for consistency (strip it — the
+            // underlying shadow-table SQL is always unqualified/`main`).
+            // Any other `db.` prefix is rejected with the same wording used
+            // by those functions for attached databases.
+            let table_name = if let Some(rest) = raw_arg.strip_prefix("main.") {
+                rest.to_string()
+            } else if let Some(dot) = raw_arg.find('.') {
+                let db_name = &raw_arg[..dot];
+                return Err(Error::Module(format!(
+                    "vector_rebuild_index is not supported for tables in attached database '{db_name}' yet; only 'main' is supported"
+                )));
+            } else {
+                raw_arg
+            };
             let db = ctx.db();
 
             let meta_json = db.query_row(
