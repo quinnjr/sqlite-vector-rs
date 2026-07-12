@@ -18,8 +18,9 @@ fn sqlite3_extension_init(db: &Connection) -> Result<()> {
         .with_update()
         .with_transactions()
         .with_find_function();
-    db.create_module("vector", module, ())?;
-    scalar::register_scalar_functions(db)?;
+    let registry = vtab::Registry::default();
+    db.create_module("vector", module, registry.clone())?;
+    scalar::register_scalar_functions(db, registry)?;
     Ok(())
 }
 

@@ -7,10 +7,12 @@ use crate::distance::{DistanceMetric, compute_distance};
 use crate::index::HnswIndex;
 use crate::json::{blob_to_json, json_to_blob};
 use crate::types::VectorType;
+use crate::vtab::Registry;
 use crate::vtab::shadow::ShadowOps;
+use crate::vtab::transaction::persist_index;
 
 /// Register all standalone scalar functions on a connection.
-pub fn register_scalar_functions(db: &Connection) -> Result<()> {
+pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<()> {
     // vector_distance(blob_a, blob_b, metric, type) -> REAL
     db.create_scalar_function(
         "vector_distance",
@@ -267,6 +269,27 @@ pub fn register_scalar_functions(db: &Connection) -> Result<()> {
             Ok(())
         },
     )?;
+
+    // vector_sync_index(table_name) -> INTEGER (1 always: forces a persist of
+    // the in-memory HNSW graph + row-count/max-rowid state, regardless of the
+    // table's sync_every threshold).
+    {
+        let registry = registry.clone();
+        db.create_scalar_function(
+            "vector_sync_index",
+            &FunctionOptions::default().set_n_args(1),
+            move |ctx, args| {
+                let table_name = args[0].get_str()?.to_owned();
+                let (state, _config) = registry.get(&table_name).ok_or_else(|| {
+                    Error::Module(format!("no vector table named {table_name}"))
+                })?;
+                let mut s = state.borrow_mut();
+                persist_index(ctx.db(), &table_name, &mut s)?;
+                ctx.set_result(1i64)?;
+                Ok(())
+            },
+        )?;
+    }
 
     Ok(())
 }

@@ -25,6 +25,7 @@ pub struct VectorTableConfig {
     pub metric: DistanceMetric,
     pub hnsw_params: HnswParams,
     pub metadata_columns: Vec<(String, String)>,
+    pub sync_every: u64,
 }
 
 impl VectorTableConfig {
@@ -43,6 +44,7 @@ impl VectorTableConfig {
         let mut metric = DistanceMetric::L2;
         let mut hnsw_params = HnswParams::default();
         let mut metadata_columns = Vec::new();
+        let mut sync_every: u64 = 1024;
 
         for &arg in &args[3..] {
             let (key, value) = arg
@@ -86,6 +88,15 @@ impl VectorTableConfig {
                 "metadata" => {
                     metadata_columns = parse_metadata_columns(value)?;
                 }
+                "sync_every" => {
+                    let n: u64 = value
+                        .parse()
+                        .map_err(|_| ConfigError(format!("invalid sync_every: {value}")))?;
+                    if n == 0 {
+                        return Err(ConfigError("sync_every must be >= 1".into()));
+                    }
+                    sync_every = n;
+                }
                 other => {
                     return Err(ConfigError(format!("unknown parameter: {other}")));
                 }
@@ -102,6 +113,7 @@ impl VectorTableConfig {
             metric,
             hnsw_params,
             metadata_columns,
+            sync_every,
         })
     }
 
@@ -113,6 +125,7 @@ impl VectorTableConfig {
             "m": self.hnsw_params.m,
             "ef_construction": self.hnsw_params.ef_construction,
             "ef_search": self.hnsw_params.ef_search,
+            "sync_every": self.sync_every,
         })
         .to_string()
     }

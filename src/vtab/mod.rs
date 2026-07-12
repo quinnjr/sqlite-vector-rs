@@ -4,14 +4,17 @@ pub mod shadow;
 pub mod transaction;
 
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 
 use sqlite3_ext::query::ToParam;
 use sqlite3_ext::vtab::{
     ChangeInfo, ChangeType, ConstraintOp, CreateVTab, DisconnectResult, FindFunctionVTab,
     IndexInfo, TransactionVTab, UpdateVTab, VTab, VTabConnection, VTabFunctionList,
 };
-use sqlite3_ext::{Error, FromValue, Result, SQLITE_EMPTY, ValueRef, function::Context};
+use sqlite3_ext::{
+    Error, FallibleIteratorMut, FromValue, Result, SQLITE_EMPTY, ValueRef, function::Context,
+};
 
 use crate::index::HnswIndex;
 use crate::vtab::config::VectorTableConfig;
@@ -141,15 +144,92 @@ fn fetch_row_from_shadow(
 }
 
 // ---------------------------------------------------------------------------
+// Registry — shared between the vtab module and the scalar functions on one
+// connection, keyed by table name.
+// ---------------------------------------------------------------------------
+
+pub struct RegistryEntry {
+    pub state: Weak<RefCell<IndexState>>,
+    pub config: VectorTableConfig,
+}
+
+/// Shared between the vtab module and the scalar functions on one connection.
+/// SQLite serializes all access on a connection; the Mutex satisfies Send
+/// bounds, and the unsafe impls mirror VectorTable's single-thread invariant.
+#[derive(Clone, Default)]
+pub struct Registry(pub Arc<Mutex<HashMap<String, RegistryEntry>>>);
+unsafe impl Send for Registry {}
+unsafe impl Sync for Registry {}
+
+impl Registry {
+    pub fn register(&self, name: &str, state: &Arc<RefCell<IndexState>>, config: &VectorTableConfig) {
+        self.0.lock().unwrap().insert(
+            name.to_string(),
+            RegistryEntry {
+                state: Arc::downgrade(state),
+                config: config.clone(),
+            },
+        );
+    }
+
+    pub fn get(&self, name: &str) -> Option<(Arc<RefCell<IndexState>>, VectorTableConfig)> {
+        let map = self.0.lock().unwrap();
+        let e = map.get(name)?;
+        Some((e.state.upgrade()?, e.config.clone()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile: bring an in-memory HNSW index up to date with the `_data` shadow
+// table after a fresh connect (or a rollback). Adds rows present in `_data`
+// but missing from the graph; if the graph still holds stale keys (deletes
+// that were never persisted), rebuilds it from scratch.
+// ---------------------------------------------------------------------------
+
+pub fn reconcile_index(
+    db: &VTabConnection,
+    config: &VectorTableConfig,
+    index: HnswIndex,
+) -> Result<HnswIndex> {
+    let sql = ShadowOps::select_ids_vectors_sql(&config.table_name);
+    let mut stmt = db.prepare(&sql)?;
+    stmt.query(())?;
+    let mut count: usize = 0;
+    while let Some(row) = stmt.next()? {
+        count += 1;
+        let id = row[0].get_i64() as u64;
+        if !index.contains(id) {
+            index
+                .add(id, row[1].get_blob()?)
+                .map_err(|e| Error::Module(e.to_string()))?;
+        }
+    }
+    if index.len() == count {
+        return Ok(index);
+    }
+    // Graph holds keys that no longer exist in _data (deletes lost since the
+    // last persist): rebuild from scratch.
+    let fresh = HnswIndex::new(config.dim, config.vtype, config.metric, Some(config.hnsw_params))
+        .map_err(|e| Error::Module(e.to_string()))?;
+    let mut stmt = db.prepare(&sql)?;
+    stmt.query(())?;
+    while let Some(row) = stmt.next()? {
+        fresh
+            .add(row[0].get_i64() as u64, row[1].get_blob()?)
+            .map_err(|e| Error::Module(e.to_string()))?;
+    }
+    Ok(fresh)
+}
+
+// ---------------------------------------------------------------------------
 // Shared init logic used by both connect and create
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::arc_with_non_send_sync)]
-fn init<'vtab>(
+fn init(
     db: &VTabConnection,
     args: &[&str],
     verify_against_meta: bool,
-) -> Result<(String, VectorTable<'vtab>)> {
+) -> Result<VectorTableConfig> {
     let mut config = VectorTableConfig::parse(args).map_err(|e| Error::Module(e.to_string()))?;
 
     // On connect (not create) reconcile the parsed args against the persisted
@@ -171,6 +251,22 @@ fn init<'vtab>(
         config.hnsw_params = params;
     }
 
+    Ok(config)
+}
+
+// ---------------------------------------------------------------------------
+// Shared vtab construction used by both connect and create, after the shadow
+// tables (and, for create, the meta row) already exist. Loads any persisted
+// index, reconciles it against `_data`, registers it, and wires up the
+// knn_match overload.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::arc_with_non_send_sync)]
+fn build_vtab<'vtab>(
+    db: &VTabConnection,
+    aux: &Registry,
+    config: VectorTableConfig,
+) -> Result<(String, VectorTable<'vtab>)> {
     let schema = config.vtab_schema();
 
     // Try to reload a previously persisted index; fall back to a fresh one.
@@ -196,6 +292,8 @@ fn init<'vtab>(
         .map_err(|e| Error::Module(e.to_string()))?,
     };
 
+    let index = reconcile_index(db, &config, index)?;
+
     let snapshot = index
         .save_to_buffer()
         .map_err(|e| Error::Module(e.to_string()))?;
@@ -203,7 +301,10 @@ fn init<'vtab>(
         index,
         dirty: false,
         last_committed: Some(snapshot),
+        changes_since_persist: 0,
     }));
+
+    aux.register(&config.table_name, &state, &config);
 
     let functions = VTabFunctionList::default();
     // Register knn_match as a 2-arg overloaded function (col, param).
@@ -232,15 +333,16 @@ fn init<'vtab>(
 // ---------------------------------------------------------------------------
 
 impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
-    type Aux = ();
+    type Aux = Registry;
     type Cursor = VectorCursor;
 
     fn connect(
         db: &'vtab VTabConnection,
-        _aux: &'vtab Self::Aux,
+        aux: &'vtab Self::Aux,
         args: &[&str],
     ) -> Result<(String, Self)> {
-        init(db, args, true)
+        let config = init(db, args, true)?;
+        build_vtab(db, aux, config)
     }
 
     fn best_index(&'vtab self, info: &mut IndexInfo) -> Result<()> {
@@ -334,18 +436,18 @@ impl<'vtab> CreateVTab<'vtab> for VectorTable<'vtab> {
         aux: &'vtab Self::Aux,
         args: &[&str],
     ) -> Result<(String, Self)> {
-        let (schema, vtab) = init(db, args, false)?;
+        let config = init(db, args, false)?;
 
-        // Create the shadow tables
-        db.execute(&ShadowOps::create_data_table_sql(&vtab.config), ())?;
-        db.execute(&ShadowOps::create_index_table_sql(&vtab.config), ())?;
+        // Create the shadow tables before the index is loaded/reconciled, so
+        // build_vtab's reconcile pass (and any future connect) sees them.
+        db.execute(&ShadowOps::create_data_table_sql(&config), ())?;
+        db.execute(&ShadowOps::create_index_table_sql(&config), ())?;
 
         // Persist the resolved config so a bare-name vector_rebuild_index(t)
         // and future connect()s can recover the real dim/type/metric/HNSW params.
-        save_meta_to_shadow(db, &vtab.config.table_name, &vtab.config.to_meta_json())?;
+        save_meta_to_shadow(db, &config.table_name, &config.to_meta_json())?;
 
-        let _ = aux;
-        Ok((schema, vtab))
+        build_vtab(db, aux, config)
     }
 
     fn destroy(self) -> DisconnectResult<Self> {
@@ -378,7 +480,11 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                     .index
                     .remove(rowid as u64)
                     .map_err(|e| Error::Module(e.to_string()))?;
-                self.state.borrow_mut().dirty = true;
+                {
+                    let mut s = self.state.borrow_mut();
+                    s.dirty = true;
+                    s.changes_since_persist += 1;
+                }
                 Ok(0)
             }
             ChangeType::Insert => {
@@ -418,7 +524,11 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                     .add(rowid as u64, &vector_blob)
                     .map_err(|e| Error::Module(e.to_string()))?;
                 drop(state);
-                self.state.borrow_mut().dirty = true;
+                {
+                    let mut s = self.state.borrow_mut();
+                    s.dirty = true;
+                    s.changes_since_persist += 1;
+                }
 
                 Ok(rowid)
             }
@@ -539,7 +649,11 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                         .add(new_rowid as u64, &final_vector)
                         .map_err(|e| Error::Module(e.to_string()))?;
                     drop(state);
-                    self.state.borrow_mut().dirty = true;
+                    {
+                        let mut s = self.state.borrow_mut();
+                        s.dirty = true;
+                        s.changes_since_persist += 1;
+                    }
                 }
 
                 Ok(new_rowid)
@@ -561,6 +675,8 @@ impl<'vtab> TransactionVTab<'vtab> for VectorTable<'vtab> {
             table_name: self.config.table_name.clone(),
             db: self.db,
             snapshots: Vec::new(),
+            sync_every: self.config.sync_every,
+            config: self.config.clone(),
         })
     }
 }

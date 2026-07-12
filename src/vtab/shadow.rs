@@ -118,6 +118,12 @@ impl ShadowOps {
     pub fn select_index_sql(table_name: &str) -> String {
         format!("SELECT value FROM \"{table_name}_index\" WHERE key = ?")
     }
+
+    /// Select `(id, vector)` pairs from the `_data` shadow table, used by
+    /// `reconcile_index` to add missing rows / rebuild the graph from scratch.
+    pub fn select_ids_vectors_sql(table_name: &str) -> String {
+        format!("SELECT id, vector FROM \"{table_name}_data\"")
+    }
 }
 
 #[cfg(test)]

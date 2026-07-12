@@ -76,6 +76,11 @@ impl HnswIndex {
         self.len() == 0
     }
 
+    /// Returns true if the index contains a vector for the given key.
+    pub fn contains(&self, key: u64) -> bool {
+        self.inner.contains(key)
+    }
+
     /// Add a vector to the index. The blob must match the index's type and dimension.
     pub fn add(&self, key: u64, blob: &[u8]) -> Result<(), IndexError> {
         self.reserve_if_needed()?;
