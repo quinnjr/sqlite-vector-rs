@@ -279,12 +279,26 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
             "vector_sync_index",
             &FunctionOptions::default().set_n_args(1),
             move |ctx, args| {
-                let table_name = args[0].get_str()?.to_owned();
-                let (state, _config) = registry.get(&table_name).ok_or_else(|| {
-                    Error::Module(format!("no vector table named {table_name}"))
-                })?;
+                let name_arg = args[0].get_str()?.to_owned();
+                let (state, config) = registry.get(&name_arg).map_err(Error::Module)?;
+
+                // `persist_index` builds its shadow-table SQL from a bare
+                // table name (unqualified by database), so it always writes
+                // to the shadow tables in `main`. Persisting a table that
+                // lives in a different attached database would silently
+                // write into the wrong (or nonexistent) shadow tables in
+                // `main`, so refuse that case explicitly rather than
+                // qualifying the SQL — this keeps the fix scoped to
+                // registry key/lookup disambiguation.
+                if config.db_name != "main" {
+                    return Err(Error::Module(format!(
+                        "vector_sync_index is not supported for tables in attached database '{}' yet; only 'main' is supported",
+                        config.db_name
+                    )));
+                }
+
                 let mut s = state.borrow_mut();
-                persist_index(ctx.db(), &table_name, &mut s)?;
+                persist_index(ctx.db(), &config.table_name, &mut s)?;
                 ctx.set_result(1i64)?;
                 Ok(())
             },

@@ -352,3 +352,36 @@ fn knn_with_metadata_filter_does_not_truncate() {
     assert_eq!(ids.len(), 2, "filter must not shrink results below LIMIT");
     assert_eq!(ids, vec![3, 4]);
 }
+
+#[test]
+fn vector_sync_index_disambiguates_same_named_tables_across_databases() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "ATTACH ':memory:' AS aux;
+         CREATE VIRTUAL TABLE main.t USING vector(dim=2, type=float4, metric=l2, sync_every=1000000);
+         CREATE VIRTUAL TABLE aux.t USING vector(dim=2, type=float4, metric=l2, sync_every=1000000);
+         INSERT INTO main.t(vector) VALUES (vector_from_json('[1.0, 0.0]', 'float4'));
+         INSERT INTO aux.t(vector) VALUES (vector_from_json('[0.0, 1.0]', 'float4'));
+         INSERT INTO aux.t(vector) VALUES (vector_from_json('[0.0, 2.0]', 'float4'));",
+    )
+    .unwrap();
+
+    // Bare name matches both main.t and aux.t: must be rejected as ambiguous,
+    // never silently pick one (or worse, write to the wrong shadow table).
+    let err = conn
+        .query_row("SELECT vector_sync_index('t')", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ambiguous"),
+        "expected an ambiguity error, got: {msg}"
+    );
+
+    // Qualified name resolves unambiguously to main.t's registry entry and
+    // succeeds (rather than erroring or picking an arbitrary same-named
+    // entry).
+    let result: i64 = conn
+        .query_row("SELECT vector_sync_index('main.t')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(result, 1);
+}

@@ -162,9 +162,16 @@ unsafe impl Send for Registry {}
 unsafe impl Sync for Registry {}
 
 impl Registry {
-    pub fn register(&self, name: &str, state: &Arc<RefCell<IndexState>>, config: &VectorTableConfig) {
+    /// Build the qualified `db.table` key used internally so that
+    /// same-named vector tables in different attached databases (or main
+    /// vs temp) don't overwrite each other's entry.
+    fn qualified_key(config: &VectorTableConfig) -> String {
+        format!("{}.{}", config.db_name, config.table_name)
+    }
+
+    pub fn register(&self, state: &Arc<RefCell<IndexState>>, config: &VectorTableConfig) {
         self.0.lock().unwrap().insert(
-            name.to_string(),
+            Self::qualified_key(config),
             RegistryEntry {
                 state: Arc::downgrade(state),
                 config: config.clone(),
@@ -172,10 +179,47 @@ impl Registry {
         );
     }
 
-    pub fn get(&self, name: &str) -> Option<(Arc<RefCell<IndexState>>, VectorTableConfig)> {
+    /// Look up a registered table by name. `name` may be a qualified
+    /// `db.table` (exact match against the registry key) or a bare
+    /// `table` (matched by suffix against `.table` across all registered
+    /// entries). A bare name that matches more than one entry is
+    /// ambiguous and returns an error rather than silently picking one.
+    pub fn get(
+        &self,
+        name: &str,
+    ) -> std::result::Result<(Arc<RefCell<IndexState>>, VectorTableConfig), String> {
         let map = self.0.lock().unwrap();
-        let e = map.get(name)?;
-        Some((e.state.upgrade()?, e.config.clone()))
+
+        if name.contains('.') {
+            let e = map
+                .get(name)
+                .ok_or_else(|| format!("no vector table named {name}"))?;
+            let state = e
+                .state
+                .upgrade()
+                .ok_or_else(|| format!("no vector table named {name}"))?;
+            return Ok((state, e.config.clone()));
+        }
+
+        let suffix = format!(".{name}");
+        let mut matches: Vec<&RegistryEntry> = map
+            .iter()
+            .filter(|(k, _)| k.ends_with(&suffix))
+            .map(|(_, e)| e)
+            .collect();
+
+        match matches.len() {
+            0 => Err(format!("no vector table named {name}")),
+            1 => {
+                let e = matches.remove(0);
+                let state = e
+                    .state
+                    .upgrade()
+                    .ok_or_else(|| format!("no vector table named {name}"))?;
+                Ok((state, e.config.clone()))
+            }
+            _ => Err(format!("ambiguous table name '{name}'; qualify as 'db.{name}'")),
+        }
     }
 }
 
@@ -304,7 +348,7 @@ fn build_vtab<'vtab>(
         changes_since_persist: 0,
     }));
 
-    aux.register(&config.table_name, &state, &config);
+    aux.register(&state, &config);
 
     let functions = VTabFunctionList::default();
     // Register knn_match as a 2-arg overloaded function (col, param).

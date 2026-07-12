@@ -97,10 +97,26 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
                 .load_from_buffer(&buf)
                 .map_err(|e| Error::Module(e.to_string()))?;
             s.dirty = false;
+            // The restored snapshot equals `last_committed`, so there are no
+            // pending (unpersisted) changes yet. The reconcile pass below may
+            // re-add rows that are already in `_data` but not yet in the
+            // graph; those additions are themselves unpersisted, but
+            // `reconcile_index` doesn't currently report a count, so we
+            // conservatively reset to 0 here and let the existing
+            // `sync_every`/dirty-tracking on subsequent mutations (or a
+            // future explicit `vector_sync_index`) catch up. This matches
+            // the "reset to 0" fallback called out in the review finding.
+            s.changes_since_persist = 0;
         }
         // `last_committed` may predate commits that survived this rollback
         // (rows persisted to `_data` before the rollback but never persisted
         // to the graph): replay them from `_data`, same code path as connect.
+        //
+        // IMPORTANT: build the reconciled index from a *moved-out* snapshot
+        // index without mutating `state` first. If `reconcile_index` errors,
+        // put the original (snapshot-restored) index back into `state`
+        // before propagating the error, so the table never serves from an
+        // empty placeholder index.
         let mut s = self.state.borrow_mut();
         let placeholder = HnswIndex::new(
             self.config.dim,
@@ -110,8 +126,27 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
         )
         .map_err(|e| Error::Module(e.to_string()))?;
         let index = std::mem::replace(&mut s.index, placeholder);
-        s.index = crate::vtab::reconcile_index(db, &self.config, index)?;
-        Ok(())
+        match crate::vtab::reconcile_index(db, &self.config, index) {
+            Ok(reconciled) => {
+                s.index = reconciled;
+                Ok(())
+            }
+            Err(e) => {
+                // `index` was moved into `reconcile_index`; on error we no
+                // longer have it back, so rebuild the same snapshot-restored
+                // state from `last_committed` (which is exactly what `index`
+                // held before the reconcile attempt) rather than leaving the
+                // empty placeholder installed.
+                let buf = s
+                    .last_committed
+                    .clone()
+                    .expect("last_committed primed at connect/create");
+                s.index
+                    .load_from_buffer(&buf)
+                    .map_err(|load_err| Error::Module(load_err.to_string()))?;
+                Err(e)
+            }
+        }
     }
 
     fn savepoint(&mut self, n: i32) -> Result<()> {
