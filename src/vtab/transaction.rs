@@ -33,6 +33,11 @@ pub struct VectorTransaction {
     /// Safety: valid for the vtab lifetime — SQLite keeps the connection alive.
     pub db: *const VTabConnection,
     pub snapshots: Vec<(i32, Vec<u8>)>,
+    /// Serialized index state as of transaction start (`begin`). Used as the
+    /// `rollback_to` fallback when the target savepoint predates the vtab's
+    /// enrollment in the transaction, so its snapshot was never captured.
+    /// `None` in exact mode (no index). See `begin()` for the rationale.
+    pub begin_base: Option<Vec<u8>>,
     pub sync_every: u64,
     pub config: VectorTableConfig,
     /// Prebuilt `SELECT id, vector FROM "<t>_data"` SQL, cloned from
@@ -204,8 +209,8 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
     }
 
     fn rollback_to(&mut self, n: i32) -> Result<()> {
-        // Nothing here mutates `state` — only `index` and `last_committed`
-        // are read — so a shared borrow suffices.
+        // Nothing here mutates `state` — only `index` and `begin_base` are
+        // read — so a shared borrow suffices.
         let s = self.state.borrow();
         let Some(idx_ref) = &s.index else {
             // Exact mode: no HNSW graph to roll back.
@@ -216,7 +221,12 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
                 .load_from_buffer(&self.snapshots[idx].1)
                 .map_err(|e| Error::Module(e.to_string()))?;
             self.snapshots.truncate(idx + 1);
-        } else if let Some(buf) = &s.last_committed {
+        } else if let Some(buf) = &self.begin_base {
+            // Target savepoint predates the vtab's first write in this
+            // transaction, so we never snapshotted it. "Undo everything after
+            // <sp>" therefore means "restore the transaction's starting
+            // state" — NOT the connect-time `last_committed`, which omits any
+            // rows committed by earlier transactions on this connection.
             idx_ref
                 .load_from_buffer(buf)
                 .map_err(|e| Error::Module(e.to_string()))?;
