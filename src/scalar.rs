@@ -109,29 +109,34 @@ pub fn register_scalar_functions(db: &Connection) -> Result<()> {
         },
     )?;
 
-    // vector_rebuild_index(table_name, type, metric) -> INTEGER (row count)
+    // vector_rebuild_index(table_name) -> INTEGER (row count)
     //
-    // Reads all vectors from the shadow data table, builds a fresh HNSW index,
-    // and serializes it back to the shadow index table. Returns the number of
-    // vectors indexed.
+    // Reads the persisted table config from the `meta` row in the `_index`
+    // shadow table, reads all vectors from the shadow data table, builds a
+    // fresh HNSW index using the table's real dim/type/metric/HNSW params,
+    // and serializes it back to the shadow index table. Returns the number
+    // of vectors indexed.
     //
     // NOTE: This writes directly to shadow tables, bypassing the vtab's
     // in-memory index. A running vtab won't see the rebuilt index until
     // reconnect. Intended for offline maintenance, not live use.
     db.create_scalar_function(
         "vector_rebuild_index",
-        &FunctionOptions::default().set_n_args(3),
+        &FunctionOptions::default().set_n_args(1),
         |ctx, args| {
             let table_name = args[0].get_str()?.to_owned();
-            let type_name = args[1].get_str()?.to_owned();
-            let metric_name = args[2].get_str()?.to_owned();
-
-            let vtype =
-                VectorType::from_name(&type_name).map_err(|e| Error::Module(e.to_string()))?;
-            let metric = DistanceMetric::from_name(&metric_name)
-                .map_err(|e| Error::Module(e.to_string()))?;
-
             let db = ctx.db();
+
+            let meta_json = db.query_row(
+                &ShadowOps::select_index_sql(&table_name),
+                ["meta"],
+                |row| Ok(row[0].get_str()?.to_owned()),
+            )?;
+            let meta: serde_json::Value =
+                serde_json::from_str(&meta_json).map_err(|e| Error::Module(e.to_string()))?;
+            let (dim, vtype, metric, params) =
+                crate::vtab::config::VectorTableConfig::params_from_meta(&meta)
+                    .map_err(|e| Error::Module(e.to_string()))?;
 
             // Read all (rowid, vector_blob) pairs from the data shadow table.
             let sql = ShadowOps::select_all_data_sql(&table_name);
@@ -150,11 +155,8 @@ pub fn register_scalar_functions(db: &Connection) -> Result<()> {
                 return Ok(());
             }
 
-            // Infer dimension from the first vector blob.
-            let dim = rows[0].1.len() / vtype.element_size();
-
-            // Build a fresh index and insert every vector.
-            let index = HnswIndex::new(dim, vtype, metric, None)
+            // Build a fresh index (using the persisted params) and insert every vector.
+            let index = HnswIndex::new(dim, vtype, metric, Some(params))
                 .map_err(|e| Error::Module(e.to_string()))?;
             for (id, blob) in &rows {
                 index

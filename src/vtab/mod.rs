@@ -62,11 +62,27 @@ fn load_index_from_shadow(db: &VTabConnection, table_name: &str) -> Result<Optio
 }
 
 /// Persist schema/config metadata to the `_index` shadow table.
-#[allow(dead_code)]
 fn save_meta_to_shadow(db: &VTabConnection, table_name: &str, meta_json: &str) -> Result<()> {
     let sql = ShadowOps::upsert_index_sql(table_name);
     db.execute(&sql, ["meta", meta_json])?;
     Ok(())
+}
+
+/// Load the persisted config `meta` row from the `_index` shadow table, if present.
+fn load_meta_from_shadow(
+    db: &VTabConnection,
+    table_name: &str,
+) -> Result<Option<serde_json::Value>> {
+    let sql = ShadowOps::select_index_sql(table_name);
+    match db.query_row(&sql, ["meta"], |row| Ok(row[0].get_str()?.to_owned())) {
+        Ok(meta_json) => {
+            let meta: serde_json::Value =
+                serde_json::from_str(&meta_json).map_err(|e| Error::Module(e.to_string()))?;
+            Ok(Some(meta))
+        }
+        Err(ref e) if *e == SQLITE_EMPTY => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Insert a new row into `_data` and return the auto-assigned rowid.
@@ -129,8 +145,31 @@ fn fetch_row_from_shadow(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::arc_with_non_send_sync)]
-fn init<'vtab>(db: &VTabConnection, args: &[&str]) -> Result<(String, VectorTable<'vtab>)> {
-    let config = VectorTableConfig::parse(args).map_err(|e| Error::Module(e.to_string()))?;
+fn init<'vtab>(
+    db: &VTabConnection,
+    args: &[&str],
+    verify_against_meta: bool,
+) -> Result<(String, VectorTable<'vtab>)> {
+    let mut config = VectorTableConfig::parse(args).map_err(|e| Error::Module(e.to_string()))?;
+
+    // On connect (not create) reconcile the parsed args against the persisted
+    // `meta` row: dim/type/metric must agree (they define the shape of the
+    // shadow tables and the on-disk vectors), while m/ef_construction/ef_search
+    // are HNSW tuning knobs where the persisted values always win, since the
+    // caller may omit them on subsequent CREATE VIRTUAL TABLE (re)connects.
+    if verify_against_meta
+        && let Some(meta) = load_meta_from_shadow(db, &config.table_name)?
+    {
+        let (dim, vtype, metric, params) = VectorTableConfig::params_from_meta(&meta)
+            .map_err(|e| Error::Module(e.to_string()))?;
+        if dim != config.dim || vtype != config.vtype || metric != config.metric {
+            return Err(Error::Module(format!(
+                "declared parameters disagree with persisted meta for {}",
+                config.table_name
+            )));
+        }
+        config.hnsw_params = params;
+    }
 
     let schema = config.vtab_schema();
 
@@ -201,7 +240,7 @@ impl<'vtab> VTab<'vtab> for VectorTable<'vtab> {
         _aux: &'vtab Self::Aux,
         args: &[&str],
     ) -> Result<(String, Self)> {
-        init(db, args)
+        init(db, args, true)
     }
 
     fn best_index(&'vtab self, info: &mut IndexInfo) -> Result<()> {
@@ -295,11 +334,15 @@ impl<'vtab> CreateVTab<'vtab> for VectorTable<'vtab> {
         aux: &'vtab Self::Aux,
         args: &[&str],
     ) -> Result<(String, Self)> {
-        let (schema, vtab) = init(db, args)?;
+        let (schema, vtab) = init(db, args, false)?;
 
         // Create the shadow tables
         db.execute(&ShadowOps::create_data_table_sql(&vtab.config), ())?;
         db.execute(&ShadowOps::create_index_table_sql(&vtab.config), ())?;
+
+        // Persist the resolved config so a bare-name vector_rebuild_index(t)
+        // and future connect()s can recover the real dim/type/metric/HNSW params.
+        save_meta_to_shadow(db, &vtab.config.table_name, &vtab.config.to_meta_json())?;
 
         let _ = aux;
         Ok((schema, vtab))

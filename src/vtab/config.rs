@@ -105,6 +105,44 @@ impl VectorTableConfig {
         })
     }
 
+    pub fn to_meta_json(&self) -> String {
+        serde_json::json!({
+            "dim": self.dim,
+            "type": self.vtype.name(),
+            "metric": self.metric.name(),
+            "m": self.hnsw_params.m,
+            "ef_construction": self.hnsw_params.ef_construction,
+            "ef_search": self.hnsw_params.ef_search,
+        })
+        .to_string()
+    }
+
+    pub fn params_from_meta(
+        meta: &serde_json::Value,
+    ) -> Result<(usize, VectorType, DistanceMetric, HnswParams), ConfigError> {
+        let dim = meta["dim"]
+            .as_u64()
+            .ok_or_else(|| ConfigError("meta missing dim".into()))? as usize;
+        let vtype = VectorType::from_name(
+            meta["type"]
+                .as_str()
+                .ok_or_else(|| ConfigError("meta missing type".into()))?,
+        )
+        .map_err(|e| ConfigError(e.to_string()))?;
+        let metric = DistanceMetric::from_name(
+            meta["metric"]
+                .as_str()
+                .ok_or_else(|| ConfigError("meta missing metric".into()))?,
+        )
+        .map_err(|e| ConfigError(e.to_string()))?;
+        let params = HnswParams {
+            m: meta["m"].as_u64().unwrap_or(16) as usize,
+            ef_construction: meta["ef_construction"].as_u64().unwrap_or(200) as usize,
+            ef_search: meta["ef_search"].as_u64().unwrap_or(64) as usize,
+        };
+        Ok((dim, vtype, metric, params))
+    }
+
     pub fn vtab_schema(&self) -> String {
         let mut cols = vec![
             "id INTEGER PRIMARY KEY".to_string(),

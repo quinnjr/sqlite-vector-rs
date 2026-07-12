@@ -307,6 +307,28 @@ fn order_by_distance_desc_returns_farthest() {
 }
 
 #[test]
+fn rebuild_index_one_arg_uses_persisted_config() {
+    let conn = open_with_extension();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE r USING vector(dim=2, type=float4, metric=cosine, m=8, ef_construction=64);
+         INSERT INTO r(vector) VALUES (vector_from_json('[1.0, 0.0]', 'float4'));
+         INSERT INTO r(vector) VALUES (vector_from_json('[0.0, 1.0]', 'float4'));",
+    )
+    .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT vector_rebuild_index('r')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2);
+    // Meta row must exist and carry the table's parameters.
+    let meta: String = conn
+        .query_row("SELECT value FROM r_index WHERE key = 'meta'", [], |r| r.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(v["metric"], "cosine");
+    assert_eq!(v["m"], 8);
+}
+
+#[test]
 fn knn_with_metadata_filter_does_not_truncate() {
     let conn = open_with_extension();
     conn.execute_batch(

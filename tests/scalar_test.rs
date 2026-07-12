@@ -63,7 +63,7 @@ fn rebuild_index_on_existing_table() {
     // Rebuild the index from scratch
     let count: i64 = conn
         .query_row(
-            "SELECT vector_rebuild_index('emb', 'float4', 'l2')",
+            "SELECT vector_rebuild_index('emb')",
             [],
             |row| row.get(0),
         )
@@ -79,7 +79,7 @@ fn rebuild_index_empty_table() {
 
     let count: i64 = conn
         .query_row(
-            "SELECT vector_rebuild_index('emb', 'float4', 'l2')",
+            "SELECT vector_rebuild_index('emb')",
             [],
             |row| row.get(0),
         )
@@ -179,7 +179,7 @@ fn rebuild_index_preserves_shadow_data() {
 
     // Rebuild the HNSW index
     conn.query_row(
-        "SELECT vector_rebuild_index('emb', 'float4', 'l2')",
+        "SELECT vector_rebuild_index('emb')",
         [],
         |row| row.get::<_, i64>(0),
     )

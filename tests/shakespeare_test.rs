@@ -470,7 +470,7 @@ fn shakespeare_rebuild_index() {
 
     let rebuilt: i64 = conn
         .query_row(
-            "SELECT vector_rebuild_index('shk_rebuild', 'float4', 'l2')",
+            "SELECT vector_rebuild_index('shk_rebuild')",
             [],
             |row| row.get(0),
         )
