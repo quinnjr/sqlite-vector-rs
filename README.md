@@ -110,7 +110,7 @@ CREATE VIRTUAL TABLE <name> USING vector(
     type=<vector_type>,          -- element type (required)
     metric=<distance_metric>,    -- distance metric (required)
     m=<integer>,                 -- HNSW M parameter (default: 16)
-    ef_construction=<integer>,   -- HNSW build quality (default: 128)
+    ef_construction=<integer>,   -- HNSW build quality (default: 200)
     ef_search=<integer>,         -- HNSW query quality (default: 64)
     mode=<hnsw|exact>,           -- index mode (default: hnsw)
     sync_every=<integer>,        -- rows between graph persists (default: 1024)
