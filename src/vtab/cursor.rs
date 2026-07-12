@@ -46,7 +46,7 @@ pub struct VectorCursor {
     /// Safety: valid for the vtab lifetime — VectorTable owns the config.
     pub config: *const VectorTableConfig,
     /// Safety: valid for the vtab lifetime — VectorTable owns the prebuilt SQL.
-    pub sql: *const TableSql,
+    pub(crate) sql: *const TableSql,
     pub state: Arc<RefCell<IndexState>>,
 }
 
@@ -117,10 +117,18 @@ impl VTabCursor for VectorCursor {
                 let filters = parse_index_str_filters(filter_part)?;
 
                 let mut next_arg = 1;
-                let k = if limit_taken {
-                    let k = args[next_arg].get_i64() as usize;
+                let target_k = if limit_taken {
+                    let raw = args[next_arg].get_i64();
                     next_arg += 1;
-                    k
+                    if raw < 0 {
+                        // A negative SQL LIMIT means "no limit" — fall back to
+                        // the same default used when no LIMIT is present at all.
+                        crate::vtab::DEFAULT_KNN_K
+                    } else {
+                        // Never pass an unclamped, attacker/typo-controlled value
+                        // straight to an allocator (see huge-LIMIT abort repro).
+                        raw as usize
+                    }
                 } else {
                     // Default k when no LIMIT is specified
                     crate::vtab::DEFAULT_KNN_K
@@ -128,10 +136,7 @@ impl VTabCursor for VectorCursor {
                 let filter_args = &mut args[next_arg..];
 
                 let num_meta = config.metadata_columns.len();
-                let mut fetch_sql = sql.fetch_by_id.clone();
-                append_filter_clauses(&mut fetch_sql, &filters, &config.metadata_columns)?;
 
-                let target_k = k;
                 // Short-circuit: when target_k == 0, return no rows immediately
                 if target_k == 0 {
                     self.mode = CursorMode::Knn {
@@ -175,8 +180,11 @@ impl VTabCursor for VectorCursor {
                         }
                     }
 
+                    // BinaryHeap::new() (not with_capacity(target_k + 1)): target_k
+                    // can be an unbounded, attacker/typo-controlled LIMIT value, and
+                    // the heap never holds more than min(rows, target_k) + 1 anyway.
                     let mut heap: std::collections::BinaryHeap<Hit> =
-                        std::collections::BinaryHeap::with_capacity(target_k + 1);
+                        std::collections::BinaryHeap::new();
                     while let Some(row) = stmt.next()? {
                         let r = read_scan_row(row, num_meta)?;
                         let d = crate::distance::compute_distance(
@@ -186,7 +194,12 @@ impl VTabCursor for VectorCursor {
                             config.metric,
                             config.dim,
                         )
-                        .map_err(|e| Error::Module(e.to_string()))?;
+                        .map_err(|e| {
+                            Error::Module(format!(
+                                "distance computation on '{}' failed: {e}",
+                                config.table_name
+                            ))
+                        })?;
                         heap.push(Hit(d, r));
                         if heap.len() > target_k {
                             heap.pop();
@@ -215,8 +228,13 @@ impl VTabCursor for VectorCursor {
                         .expect("HNSW index present when mode != Exact")
                         .len()
                 };
-                let mut kp = (4 * target_k).max(target_k + 16).min(index_len.max(1));
+                let mut kp = target_k
+                    .saturating_mul(4)
+                    .max(target_k.saturating_add(16))
+                    .min(index_len.max(1));
                 let mut results: Vec<KnnRow>;
+                let mut fetch_sql = sql.fetch_by_id.clone();
+                append_filter_clauses(&mut fetch_sql, &filters, &config.metadata_columns)?;
                 let mut stmt = db.prepare(&fetch_sql)?;
                 loop {
                     let hits = {
@@ -226,9 +244,15 @@ impl VTabCursor for VectorCursor {
                             .as_ref()
                             .expect("HNSW index present when mode != Exact")
                             .search(&query_blob, kp)
-                            .map_err(|e| Error::Module(e.to_string()))?
+                            .map_err(|e| {
+                                Error::Module(format!(
+                                    "KNN search on vector table '{}' failed: {e}",
+                                    config.table_name
+                                ))
+                            })?
                     };
-                    results = Vec::with_capacity(target_k);
+                    // Can never return more rows than the index holds.
+                    results = Vec::with_capacity(target_k.min(index_len));
                     for (key, dist) in &hits {
                         stmt.query(|q: &mut sqlite3_ext::query::Statement| {
                             (*key as i64).bind_param(q, 1)?;
@@ -254,7 +278,7 @@ impl VTabCursor for VectorCursor {
                     if results.len() >= target_k || kp >= index_len {
                         break;
                     }
-                    kp = (kp * 2).min(index_len);
+                    kp = kp.saturating_mul(2).min(index_len);
                 }
                 self.mode = CursorMode::Knn { results, pos: 0 };
             }
