@@ -99,6 +99,54 @@ fn update_vector_only_retains_metadata() {
 }
 
 #[test]
+fn rollback_on_fresh_connection_discards_index_entries() {
+    let conn = open_with_extension();
+    create_2d(&conn);
+    conn.execute_batch(
+        "BEGIN;
+         INSERT INTO t(vector) VALUES (vector_from_json('[0.0, 0.0]', 'float4'));
+         INSERT INTO t(vector) VALUES (vector_from_json('[0.1, 0.1]', 'float4'));
+         ROLLBACK;",
+    )
+    .unwrap();
+    // Rowids 1..2 are reused after rollback; inserts must not hit duplicate keys.
+    insert_json(&conn, "[100.0, 100.0]");
+    insert_json(&conn, "[101.0, 101.0]");
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 10",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "index must contain exactly the committed rows");
+}
+
+#[test]
+fn rollback_to_savepoint_restores_index_to_savepoint() {
+    let conn = open_with_extension();
+    create_2d(&conn);
+    insert_json(&conn, "[1.0, 1.0]");
+    conn.execute_batch(
+        "BEGIN;
+         INSERT INTO t(vector) VALUES (vector_from_json('[2.0, 2.0]', 'float4'));
+         SAVEPOINT sp1;
+         INSERT INTO t(vector) VALUES (vector_from_json('[3.0, 3.0]', 'float4'));
+         ROLLBACK TO sp1;
+         COMMIT;",
+    )
+    .unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 10",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "index must reflect rows 1 and 2 only");
+}
+
+#[test]
 fn update_metadata_only_retains_vector() {
     let conn = open_with_extension();
     create_2d_with_metadata(&conn);

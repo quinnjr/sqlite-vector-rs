@@ -154,10 +154,13 @@ fn init<'vtab>(db: &VTabConnection, args: &[&str]) -> Result<(String, VectorTabl
         .map_err(|e| Error::Module(e.to_string()))?,
     };
 
+    let snapshot = index
+        .save_to_buffer()
+        .map_err(|e| Error::Module(e.to_string()))?;
     let state = Arc::new(RefCell::new(IndexState {
         index,
         dirty: false,
-        last_committed: None,
+        last_committed: Some(snapshot),
     }));
 
     let functions = VTabFunctionList::default();
@@ -489,6 +492,7 @@ impl<'vtab> TransactionVTab<'vtab> for VectorTable<'vtab> {
             state: Arc::clone(&self.state),
             table_name: self.config.table_name.clone(),
             db: self.db,
+            snapshots: Vec::new(),
         })
     }
 }
