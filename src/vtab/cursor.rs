@@ -121,9 +121,17 @@ impl VTabCursor for VectorCursor {
                     let raw = args[next_arg].get_i64();
                     next_arg += 1;
                     if raw < 0 {
-                        // A negative SQL LIMIT means "no limit" — fall back to
-                        // the same default used when no LIMIT is present at all.
-                        crate::vtab::DEFAULT_KNN_K
+                        // SQL semantics: a negative LIMIT (e.g. `LIMIT -1`) means
+                        // "no limit" — return all matching rows. This is distinct
+                        // from LIMIT being absent entirely (which defaults to
+                        // DEFAULT_KNN_K, handled in the `else` branch below).
+                        // usize::MAX is safe here: the HNSW path clamps allocation
+                        // and oversampling via `target_k.min(index_len)` /
+                        // `.min(index_len.max(1))`, and the exact path uses an
+                        // unbounded `BinaryHeap::new()` that only evicts when it
+                        // exceeds target_k, so an unbounded target_k just means
+                        // "never evict" — i.e. keep every row.
+                        usize::MAX
                     } else {
                         // Never pass an unclamped, attacker/typo-controlled value
                         // straight to an allocator (see huge-LIMIT abort repro).
@@ -399,7 +407,13 @@ fn append_filter_clauses(
     metadata_columns: &[(String, String)],
 ) -> Result<()> {
     for (col, op) in filters {
-        let name = &metadata_columns[col - 2].0;
+        let name = &col
+            .checked_sub(2)
+            .and_then(|i| metadata_columns.get(i))
+            .ok_or_else(|| {
+                Error::Module(format!("internal error: filter column {col} out of range"))
+            })?
+            .0;
         let sql_op = filter_sql_op(op)?;
         sql.push_str(&format!(" AND {name} {sql_op} ?"));
     }
