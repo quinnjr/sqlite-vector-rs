@@ -55,12 +55,17 @@ All notable changes to this project will be documented in this file.
 - Shadow-table SQL is built once per table and the KNN fetch statement is
   reused across rows.
 - Distance kernels are single-pass and allocation-free.
+- **Library API (breaking):** `VectorType::slice_to_blob` is now the free
+  function `types::slice_to_blob`, and `VectorType::blob_to_slice` is removed —
+  use the alignment-tolerant `types::cast_blob` to decode a blob. Affects rlib
+  consumers only; the loadable-extension SQL surface is unchanged.
 
 ### Known limitations
 
-- `vector_sync_index`, `vector_ef_search`, and `vector_index_info` accept bare
-  or `db.table`-qualified names but only support tables in the `main`
-  database; attached-database vector tables are rejected.
+- `vector_sync_index`, `vector_ef_search`, `vector_index_info`, and
+  `vector_rebuild_index` accept bare or `db.table`-qualified names but only
+  support tables in the `main` database; attached-database vector tables are
+  rejected.
 - `int2`/`int4` vectors are indexed as `f32` (lossy above 2^24).
 
 ## 0.2.0
