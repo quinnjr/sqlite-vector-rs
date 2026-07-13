@@ -250,10 +250,12 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
             Some(self.config.hnsw_params),
         )
         .map_err(|e| Error::Module(e.to_string()))?;
-        // Reconcile a *fresh* empty index against `_data`: its `len() (0) !=
-        // count` always forces a full rebuild, so any ghost/stale keys left by
-        // the rolled-back writes are dropped. On error, the fresh (empty) index
-        // is already installed — recoverable on the next connect/reconcile.
+        // Reconcile a *fresh* empty index against `_data`: every current row is
+        // (re)added from the shadow data, so any ghost/stale keys left by the
+        // rolled-back writes are gone and the index exactly matches `_data`.
+        // `placeholder` is moved into `reconcile_index`; on error `s.index`
+        // still holds the pre-rollback index (never an empty placeholder),
+        // which the next connect/reconcile corrects.
         let fresh = crate::vtab::reconcile_index(db, &self.config, placeholder, &self.ids_vectors_sql)?;
         s.index = Some(fresh);
         Ok(())
