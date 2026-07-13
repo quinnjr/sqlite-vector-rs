@@ -212,7 +212,6 @@ fn autocommit_inserts_persist_lazily_not_per_row() {
     // A second assertion checks the counter keeps growing across inserts
     // (rather than being reset), which a naive "persist every Nth insert
     // where N resets differently" implementation could otherwise slip past.
-    let json = "[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]";
     let conn = open_with_extension();
     conn.execute_batch("CREATE VIRTUAL TABLE a USING vector(dim=8, type=float4, metric=l2);")
         .unwrap();
@@ -225,10 +224,12 @@ fn autocommit_inserts_persist_lazily_not_per_row() {
         v["changes_since_persist"].as_i64().unwrap()
     };
 
+    let vec_json = |i: i64| -> String { format!("[{i}.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]") };
+
     for i in 0..50 {
         conn.execute(
             "INSERT INTO a(vector) VALUES (vector_from_json(?1, 'float4'))",
-            [json],
+            [vec_json(i)],
         )
         .unwrap();
         if i == 9 {
@@ -253,11 +254,11 @@ fn autocommit_inserts_persist_lazily_not_per_row() {
         .execute_batch("CREATE VIRTUAL TABLE b USING vector(dim=8, type=float4, metric=l2);")
         .unwrap();
     conn2.execute_batch("BEGIN").unwrap();
-    for _ in 0..50 {
+    for i in 0..50 {
         conn2
             .execute(
                 "INSERT INTO b(vector) VALUES (vector_from_json(?1, 'float4'))",
-                [json],
+                [vec_json(i)],
             )
             .unwrap();
     }
@@ -274,20 +275,28 @@ fn autocommit_inserts_persist_lazily_not_per_row() {
         "autocommit and single-transaction inserts must produce identical row counts"
     );
 
+    // Query vector matches row 25 exactly, so a healthy index on both tables
+    // must return the identical *set* of nearest ids (not just a matching
+    // count) — a desynced/corrupted index would return a different id set
+    // even though both tables have 50 rows.
+    let query_vec = vec_json(25);
     let knn = |c: &rusqlite::Connection, t: &str| -> Vec<i64> {
-        c.prepare(&format!(
-            "SELECT id FROM {t} WHERE knn_match(distance, vector_from_json('{json}', 'float4')) LIMIT 10"
-        ))
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap()
+        let mut ids: Vec<i64> = c
+            .prepare(&format!(
+                "SELECT id FROM {t} WHERE knn_match(distance, vector_from_json('{query_vec}', 'float4')) LIMIT 10"
+            ))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        ids.sort_unstable();
+        ids
     };
     assert_eq!(
-        knn(&conn, "a").len(),
-        knn(&conn2, "b").len(),
-        "autocommit and single-transaction KNN result sizes must match"
+        knn(&conn, "a"),
+        knn(&conn2, "b"),
+        "autocommit and single-transaction KNN must return the identical id set for a fixed query"
     );
 }
 
@@ -971,6 +980,44 @@ fn dim_mismatch_at_connect_is_rejected() {
     assert!(
         msg.contains("disagree with persisted meta"),
         "expected a persisted-meta disagreement error from connect-time dim verification, got: {msg}"
+    );
+}
+
+#[test]
+fn missing_m_in_persisted_meta_is_rejected_at_connect() {
+    // `VectorTableConfig::params_from_meta` (src/vtab/config.rs) now hard-errors
+    // when the persisted `meta` row is missing `m` (previously it silently
+    // defaulted). Sibling to `dim_mismatch_at_connect_is_rejected`: corrupt the
+    // persisted meta by removing the `m` key directly via plain SQL, then
+    // reopen the file and reference the table so SQLite invokes xConnect,
+    // exercising the `meta["m"].as_u64().ok_or_else(...)` branch.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.db");
+    {
+        let conn = open_file_with_extension(&path);
+        conn.execute_batch("CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2);")
+            .unwrap();
+        let meta: String = conn
+            .query_row("SELECT value FROM t_index WHERE key = 'meta'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        v.as_object_mut().unwrap().remove("m");
+        conn.execute(
+            "UPDATE t_index SET value = ?1 WHERE key = 'meta'",
+            [v.to_string()],
+        )
+        .unwrap();
+    }
+    let conn = open_file_with_extension(&path);
+    let err = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("meta missing m"),
+        "expected a 'meta missing m' error from connect-time verification, got: {msg}"
     );
 }
 
