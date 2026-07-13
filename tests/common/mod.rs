@@ -35,11 +35,3 @@ fn find_extension_path() -> &'static str {
         "target/debug/libsqlite_vector_rs"
     }
 }
-
-/// Generate a random f32 vector of given dimension.
-#[allow(dead_code)]
-pub fn random_f32_vector(dim: usize) -> Vec<f32> {
-    use rand::Rng;
-    let mut rng = rand::rng();
-    (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect()
-}

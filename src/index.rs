@@ -37,7 +37,6 @@ impl std::error::Error for IndexError {}
 /// Wrapper around usearch::Index providing a typed interface.
 pub struct HnswIndex {
     inner: usearch::Index,
-    _dim: usize,
     vtype: VectorType,
 }
 
@@ -60,11 +59,7 @@ impl HnswIndex {
             multi: false,
         };
         let inner = usearch::Index::new(&opts).map_err(|e| IndexError(e.to_string()))?;
-        Ok(Self {
-            inner,
-            _dim: dim,
-            vtype,
-        })
+        Ok(Self { inner, vtype })
     }
 
     /// Number of vectors in the index.

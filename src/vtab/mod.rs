@@ -793,11 +793,9 @@ impl<'vtab> UpdateVTab<'vtab> for VectorTable<'vtab> {
                 let num_meta = self.config.metadata_columns.len();
                 let meta_args = &mut args[3..3 + num_meta];
 
-                // Validate dimension and finiteness before inserting
-                self.config
-                    .vtype
-                    .validate_blob(&vector_blob, self.config.dim)
-                    .map_err(|e| Error::Module(e.to_string()))?;
+                // Validate dimension and finiteness before inserting.
+                // `validate_finite` checks the blob size first, so it covers
+                // the dimension check too.
                 self.config
                     .vtype
                     .validate_finite(&vector_blob, self.config.dim)
