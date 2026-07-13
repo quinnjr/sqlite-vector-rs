@@ -1,4 +1,4 @@
-use sqlite_vector_rs::types::VectorType;
+use sqlite_vector_rs::types::{VectorType, cast_blob, slice_to_blob};
 
 #[test]
 fn parse_type_names() {
@@ -34,19 +34,19 @@ fn validate_blob_size() {
 #[test]
 fn blob_round_trip_float4() {
     let values: Vec<f32> = vec![1.0, 2.0, 3.0];
-    let blob = VectorType::Float4.slice_to_blob(&values);
+    let blob = slice_to_blob(&values);
     assert_eq!(blob.len(), 12);
-    let restored: &[f32] = VectorType::Float4.blob_to_slice(&blob);
-    assert_eq!(restored, &[1.0, 2.0, 3.0]);
+    let restored = cast_blob::<f32>(&blob);
+    assert_eq!(restored.as_ref(), &[1.0, 2.0, 3.0]);
 }
 
 #[test]
 fn blob_round_trip_float2() {
     use half::f16;
     let values: Vec<f16> = vec![f16::from_f32(1.0), f16::from_f32(2.0)];
-    let blob = VectorType::Float2.slice_to_blob(&values);
+    let blob = slice_to_blob(&values);
     assert_eq!(blob.len(), 4);
-    let restored: &[f16] = VectorType::Float2.blob_to_slice(&blob);
+    let restored = cast_blob::<f16>(&blob);
     assert_eq!(restored[0].to_f32(), 1.0);
     assert_eq!(restored[1].to_f32(), 2.0);
 }
@@ -54,17 +54,17 @@ fn blob_round_trip_float2() {
 #[test]
 fn reject_nan_inf_float4() {
     let with_nan: Vec<f32> = vec![1.0, f32::NAN, 3.0];
-    let blob = VectorType::Float4.slice_to_blob(&with_nan);
+    let blob = slice_to_blob(&with_nan);
     assert!(VectorType::Float4.validate_finite(&blob, 3).is_err());
 
     let with_inf: Vec<f32> = vec![1.0, f32::INFINITY, 3.0];
-    let blob = VectorType::Float4.slice_to_blob(&with_inf);
+    let blob = slice_to_blob(&with_inf);
     assert!(VectorType::Float4.validate_finite(&blob, 3).is_err());
 }
 
 #[test]
 fn validate_finite_skips_integer_types() {
     // Integer types don't have NaN/Inf, validate_finite should always pass
-    let blob = VectorType::Int4.slice_to_blob(&[1i32, 2, 3]);
+    let blob = slice_to_blob(&[1i32, 2, 3]);
     assert!(VectorType::Int4.validate_finite(&blob, 3).is_ok());
 }

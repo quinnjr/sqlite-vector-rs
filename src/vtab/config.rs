@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::distance::DistanceMetric;
-use crate::index::HnswParams;
+use crate::index::{HnswIndex, HnswParams, IndexError};
 use crate::types::VectorType;
 
 #[derive(Debug)]
@@ -15,6 +15,31 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Whether a table is served by an in-memory HNSW index or by a streaming
+/// brute-force exact scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMode {
+    Hnsw,
+    Exact,
+}
+
+impl IndexMode {
+    pub fn from_name(name: &str) -> Result<Self, ConfigError> {
+        match name {
+            "hnsw" => Ok(Self::Hnsw),
+            "exact" => Ok(Self::Exact),
+            other => Err(ConfigError(format!("unknown mode: {other}"))),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Hnsw => "hnsw",
+            Self::Exact => "exact",
+        }
+    }
+}
+
 /// Parsed configuration from CREATE VIRTUAL TABLE arguments.
 #[derive(Debug, Clone)]
 pub struct VectorTableConfig {
@@ -25,6 +50,8 @@ pub struct VectorTableConfig {
     pub metric: DistanceMetric,
     pub hnsw_params: HnswParams,
     pub metadata_columns: Vec<(String, String)>,
+    pub sync_every: u64,
+    pub mode: IndexMode,
 }
 
 impl VectorTableConfig {
@@ -43,6 +70,8 @@ impl VectorTableConfig {
         let mut metric = DistanceMetric::L2;
         let mut hnsw_params = HnswParams::default();
         let mut metadata_columns = Vec::new();
+        let mut sync_every: u64 = 1024;
+        let mut mode = IndexMode::Hnsw;
 
         for &arg in &args[3..] {
             let (key, value) = arg
@@ -86,6 +115,18 @@ impl VectorTableConfig {
                 "metadata" => {
                     metadata_columns = parse_metadata_columns(value)?;
                 }
+                "sync_every" => {
+                    let n: u64 = value
+                        .parse()
+                        .map_err(|_| ConfigError(format!("invalid sync_every: {value}")))?;
+                    if n == 0 {
+                        return Err(ConfigError("sync_every must be >= 1".into()));
+                    }
+                    sync_every = n;
+                }
+                "mode" => {
+                    mode = IndexMode::from_name(value)?;
+                }
                 other => {
                     return Err(ConfigError(format!("unknown parameter: {other}")));
                 }
@@ -102,7 +143,68 @@ impl VectorTableConfig {
             metric,
             hnsw_params,
             metadata_columns,
+            sync_every,
+            mode,
         })
+    }
+
+    pub fn to_meta_json(&self) -> String {
+        serde_json::json!({
+            "dim": self.dim,
+            "type": self.vtype.name(),
+            "metric": self.metric.name(),
+            "m": self.hnsw_params.m,
+            "ef_construction": self.hnsw_params.ef_construction,
+            "ef_search": self.hnsw_params.ef_search,
+            "sync_every": self.sync_every,
+            "mode": self.mode.name(),
+        })
+        .to_string()
+    }
+
+    pub fn params_from_meta(
+        meta: &serde_json::Value,
+    ) -> Result<(usize, VectorType, DistanceMetric, HnswParams), ConfigError> {
+        let dim = meta["dim"]
+            .as_u64()
+            .ok_or_else(|| ConfigError("meta missing dim".into()))? as usize;
+        let vtype = VectorType::from_name(
+            meta["type"]
+                .as_str()
+                .ok_or_else(|| ConfigError("meta missing type".into()))?,
+        )
+        .map_err(|e| ConfigError(e.to_string()))?;
+        let metric = DistanceMetric::from_name(
+            meta["metric"]
+                .as_str()
+                .ok_or_else(|| ConfigError("meta missing metric".into()))?,
+        )
+        .map_err(|e| ConfigError(e.to_string()))?;
+        let m = meta["m"]
+            .as_u64()
+            .ok_or_else(|| ConfigError("meta missing m".into()))? as usize;
+        let ef_construction = meta["ef_construction"]
+            .as_u64()
+            .ok_or_else(|| ConfigError("meta missing ef_construction".into()))?
+            as usize;
+        let ef_search = meta["ef_search"]
+            .as_u64()
+            .ok_or_else(|| ConfigError("meta missing ef_search".into()))?
+            as usize;
+        let params = HnswParams {
+            m,
+            ef_construction,
+            ef_search,
+        };
+        Ok((dim, vtype, metric, params))
+    }
+
+    /// Construct a fresh, empty HNSW index matching this config's
+    /// dim/type/metric/HNSW params. Shared by every "rebuild the index from
+    /// `_data`" path (reconcile, rollback, savepoint rollback-to) so they
+    /// can't drift out of sync with each other.
+    pub(crate) fn new_index(&self) -> Result<HnswIndex, IndexError> {
+        HnswIndex::new(self.dim, self.vtype, self.metric, Some(self.hnsw_params))
     }
 
     pub fn vtab_schema(&self) -> String {

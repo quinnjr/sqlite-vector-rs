@@ -7,7 +7,7 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 
-use crate::types::VectorType;
+use crate::types::{VectorType, cast_blob, slice_to_blob};
 
 #[derive(Debug)]
 pub struct ArrowError(pub String);
@@ -105,23 +105,23 @@ fn build_values_array(
         VectorType::Float4 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[f32] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<f32>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Float32, Arc::new(Float32Array::from(flat))))
         }
         VectorType::Float8 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[f64] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<f64>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Float64, Arc::new(Float64Array::from(flat))))
         }
         VectorType::Float2 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[half::f16] = vtype.blob_to_slice(blob);
+                let v = cast_blob::<half::f16>(blob);
                 flat.extend(v.iter().copied());
             }
             Ok((DataType::Float16, Arc::new(Float16Array::from(flat))))
@@ -129,24 +129,24 @@ fn build_values_array(
         VectorType::Int1 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[i8] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<i8>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Int8, Arc::new(Int8Array::from(flat))))
         }
         VectorType::Int2 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[i16] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<i16>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Int16, Arc::new(Int16Array::from(flat))))
         }
         VectorType::Int4 => {
             let mut flat = Vec::with_capacity(total_elements);
             for blob in blobs {
-                let v: &[i32] = vtype.blob_to_slice(blob);
-                flat.extend_from_slice(v);
+                let v = cast_blob::<i32>(blob);
+                flat.extend_from_slice(&v[..]);
             }
             Ok((DataType::Int32, Arc::new(Int32Array::from(flat))))
         }
@@ -165,7 +165,7 @@ fn extract_blob_from_array(
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| ArrowError("expected Float32Array".into()))?;
             let values: Vec<f32> = (0..dim).map(|i| a.value(i)).collect();
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Float8 => {
             let a = array
@@ -173,7 +173,7 @@ fn extract_blob_from_array(
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| ArrowError("expected Float64Array".into()))?;
             let values: Vec<f64> = (0..dim).map(|i| a.value(i)).collect();
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Float2 => {
             let a = array
@@ -181,7 +181,7 @@ fn extract_blob_from_array(
                 .downcast_ref::<Float16Array>()
                 .ok_or_else(|| ArrowError("expected Float16Array".into()))?;
             let values: Vec<half::f16> = (0..dim).map(|i| a.value(i)).collect();
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Int1 => {
             let a = array
@@ -189,7 +189,7 @@ fn extract_blob_from_array(
                 .downcast_ref::<Int8Array>()
                 .ok_or_else(|| ArrowError("expected Int8Array".into()))?;
             let values: Vec<i8> = (0..dim).map(|i| a.value(i)).collect();
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Int2 => {
             let a = array
@@ -197,7 +197,7 @@ fn extract_blob_from_array(
                 .downcast_ref::<Int16Array>()
                 .ok_or_else(|| ArrowError("expected Int16Array".into()))?;
             let values: Vec<i16> = (0..dim).map(|i| a.value(i)).collect();
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Int4 => {
             let a = array
@@ -205,7 +205,7 @@ fn extract_blob_from_array(
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| ArrowError("expected Int32Array".into()))?;
             let values: Vec<i32> = (0..dim).map(|i| a.value(i)).collect();
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
     }
 }
@@ -222,32 +222,32 @@ mod tests {
 
     /// Build a Float4 blob from a slice of f32 values.
     fn f32_blob(values: &[f32]) -> Vec<u8> {
-        VectorType::Float4.slice_to_blob(values)
+        slice_to_blob(values)
     }
 
     /// Build a Float8 blob from a slice of f64 values.
     fn f64_blob(values: &[f64]) -> Vec<u8> {
-        VectorType::Float8.slice_to_blob(values)
+        slice_to_blob(values)
     }
 
     /// Build an Int1 blob from a slice of i8 values.
     fn i8_blob(values: &[i8]) -> Vec<u8> {
-        VectorType::Int1.slice_to_blob(values)
+        slice_to_blob(values)
     }
 
     /// Build an Int2 blob from a slice of i16 values.
     fn i16_blob(values: &[i16]) -> Vec<u8> {
-        VectorType::Int2.slice_to_blob(values)
+        slice_to_blob(values)
     }
 
     /// Build an Int4 blob from a slice of i32 values.
     fn i32_blob(values: &[i32]) -> Vec<u8> {
-        VectorType::Int4.slice_to_blob(values)
+        slice_to_blob(values)
     }
 
     /// Build a Float2 blob from a slice of f16 values.
     fn f16_blob(values: &[f16]) -> Vec<u8> {
-        VectorType::Float2.slice_to_blob(values)
+        slice_to_blob(values)
     }
 
     // ----------------------------------------------------------------

@@ -3,7 +3,7 @@ use std::fmt;
 use half::f16;
 use serde_json::Value;
 
-use crate::types::{VectorType, VectorTypeError};
+use crate::types::{VectorType, VectorTypeError, cast_blob, slice_to_blob};
 
 /// Errors from JSON conversion.
 #[derive(Debug)]
@@ -43,7 +43,7 @@ pub fn json_to_blob(json: &str, vtype: VectorType) -> Result<Vec<u8>, JsonError>
                 }
                 values.push(h);
             }
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Float4 => {
             let mut values = Vec::with_capacity(arr.len());
@@ -54,7 +54,7 @@ pub fn json_to_blob(json: &str, vtype: VectorType) -> Result<Vec<u8>, JsonError>
                 }
                 values.push(n);
             }
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Float8 => {
             let mut values = Vec::with_capacity(arr.len());
@@ -65,7 +65,7 @@ pub fn json_to_blob(json: &str, vtype: VectorType) -> Result<Vec<u8>, JsonError>
                 }
                 values.push(n);
             }
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Int1 => {
             let mut values = Vec::with_capacity(arr.len());
@@ -73,7 +73,7 @@ pub fn json_to_blob(json: &str, vtype: VectorType) -> Result<Vec<u8>, JsonError>
                 let n = v.as_i64().ok_or(JsonError::NonNumericElement(i))? as i8;
                 values.push(n);
             }
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Int2 => {
             let mut values = Vec::with_capacity(arr.len());
@@ -81,7 +81,7 @@ pub fn json_to_blob(json: &str, vtype: VectorType) -> Result<Vec<u8>, JsonError>
                 let n = v.as_i64().ok_or(JsonError::NonNumericElement(i))? as i16;
                 values.push(n);
             }
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
         VectorType::Int4 => {
             let mut values = Vec::with_capacity(arr.len());
@@ -89,7 +89,7 @@ pub fn json_to_blob(json: &str, vtype: VectorType) -> Result<Vec<u8>, JsonError>
                 let n = v.as_i64().ok_or(JsonError::NonNumericElement(i))? as i32;
                 values.push(n);
             }
-            Ok(vtype.slice_to_blob(&values))
+            Ok(slice_to_blob(&values))
         }
     }
 }
@@ -98,27 +98,27 @@ pub fn json_to_blob(json: &str, vtype: VectorType) -> Result<Vec<u8>, JsonError>
 pub fn blob_to_json(blob: &[u8], vtype: VectorType) -> Result<String, JsonError> {
     let values: Vec<Value> = match vtype {
         VectorType::Float2 => {
-            let s: &[f16] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<f16>(blob);
             s.iter().map(|v| Value::from(v.to_f64())).collect()
         }
         VectorType::Float4 => {
-            let s: &[f32] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<f32>(blob);
             s.iter().map(|v| Value::from(*v)).collect()
         }
         VectorType::Float8 => {
-            let s: &[f64] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<f64>(blob);
             s.iter().map(|v| Value::from(*v)).collect()
         }
         VectorType::Int1 => {
-            let s: &[i8] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<i8>(blob);
             s.iter().map(|v| Value::from(*v as i64)).collect()
         }
         VectorType::Int2 => {
-            let s: &[i16] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<i16>(blob);
             s.iter().map(|v| Value::from(*v as i64)).collect()
         }
         VectorType::Int4 => {
-            let s: &[i32] = vtype.blob_to_slice(blob);
+            let s = cast_blob::<i32>(blob);
             s.iter().map(|v| Value::from(*v as i64)).collect()
         }
     };
@@ -332,7 +332,7 @@ mod tests {
     fn float4_precision_survives_round_trip() {
         // These values are exactly representable in f32.
         let inputs: Vec<f32> = vec![0.1, 0.2, 0.3, -0.1, 1.0 / 3.0];
-        let blob = VectorType::Float4.slice_to_blob(&inputs);
+        let blob = slice_to_blob(&inputs);
         let out = blob_to_json(&blob, VectorType::Float4).unwrap();
         let vals = parse_json_floats(&out);
         for (expected, actual) in inputs.iter().zip(vals.iter()) {
@@ -357,7 +357,7 @@ mod tests {
             -std::f64::consts::SQRT_2,
             1.234_567_890_123_456_8e10,
         ];
-        let blob = VectorType::Float8.slice_to_blob(&inputs);
+        let blob = slice_to_blob(&inputs);
         let out = blob_to_json(&blob, VectorType::Float8).unwrap();
         let vals = parse_json_floats(&out);
         for (expected, actual) in inputs.iter().zip(vals.iter()) {
@@ -379,24 +379,24 @@ mod tests {
     fn int1_negative_and_zero() {
         let json = "[-128, -1, 0, 1, 127]";
         let blob = json_to_blob(json, VectorType::Int1).unwrap();
-        let slice: &[i8] = VectorType::Int1.blob_to_slice(&blob);
-        assert_eq!(slice, &[-128_i8, -1, 0, 1, 127]);
+        let slice = cast_blob::<i8>(&blob);
+        assert_eq!(slice.as_ref(), &[-128_i8, -1, 0, 1, 127]);
     }
 
     #[test]
     fn int2_negative_and_zero() {
         let json = "[-32768, -100, 0, 100, 32767]";
         let blob = json_to_blob(json, VectorType::Int2).unwrap();
-        let slice: &[i16] = VectorType::Int2.blob_to_slice(&blob);
-        assert_eq!(slice, &[-32768_i16, -100, 0, 100, 32767]);
+        let slice = cast_blob::<i16>(&blob);
+        assert_eq!(slice.as_ref(), &[-32768_i16, -100, 0, 100, 32767]);
     }
 
     #[test]
     fn int4_negative_and_zero() {
         let json = "[-2147483648, -1, 0, 1, 2147483647]";
         let blob = json_to_blob(json, VectorType::Int4).unwrap();
-        let slice: &[i32] = VectorType::Int4.blob_to_slice(&blob);
-        assert_eq!(slice, &[-2147483648_i32, -1, 0, 1, 2147483647]);
+        let slice = cast_blob::<i32>(&blob);
+        assert_eq!(slice.as_ref(), &[-2147483648_i32, -1, 0, 1, 2147483647]);
     }
 
     // ------------------------------------------------------------------ //

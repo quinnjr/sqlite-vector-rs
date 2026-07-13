@@ -1,7 +1,7 @@
 mod common;
 
 use common::open_with_extension;
-use sqlite_vector_rs::types::VectorType;
+use sqlite_vector_rs::types::slice_to_blob;
 
 #[test]
 fn vector_from_json_and_back() {
@@ -19,8 +19,8 @@ fn vector_from_json_and_back() {
 #[test]
 fn vector_distance_l2() {
     let conn = open_with_extension();
-    let a = VectorType::Float4.slice_to_blob(&[1.0f32, 0.0, 0.0]);
-    let b = VectorType::Float4.slice_to_blob(&[0.0f32, 1.0, 0.0]);
+    let a = slice_to_blob(&[1.0f32, 0.0, 0.0]);
+    let b = slice_to_blob(&[0.0f32, 1.0, 0.0]);
     let dist: f64 = conn
         .query_row(
             "SELECT vector_distance(?, ?, 'l2', 'float4')",
@@ -34,7 +34,7 @@ fn vector_distance_l2() {
 #[test]
 fn vector_dims() {
     let conn = open_with_extension();
-    let v = VectorType::Float4.slice_to_blob(&[1.0f32, 2.0, 3.0, 4.0]);
+    let v = slice_to_blob(&[1.0f32, 2.0, 3.0, 4.0]);
     let dims: i64 = conn
         .query_row("SELECT vector_dims(?, 'float4')", [v.as_slice()], |row| {
             row.get(0)
@@ -49,9 +49,9 @@ fn rebuild_index_on_existing_table() {
     conn.execute_batch("CREATE VIRTUAL TABLE emb USING vector(dim=3, type=float4, metric=l2)")
         .unwrap();
 
-    let v1 = VectorType::Float4.slice_to_blob(&[1.0f32, 0.0, 0.0]);
-    let v2 = VectorType::Float4.slice_to_blob(&[0.0f32, 1.0, 0.0]);
-    let v3 = VectorType::Float4.slice_to_blob(&[0.0f32, 0.0, 1.0]);
+    let v1 = slice_to_blob(&[1.0f32, 0.0, 0.0]);
+    let v2 = slice_to_blob(&[0.0f32, 1.0, 0.0]);
+    let v3 = slice_to_blob(&[0.0f32, 0.0, 1.0]);
 
     conn.execute("INSERT INTO emb(vector) VALUES(?)", [v1.as_slice()])
         .unwrap();
@@ -62,11 +62,7 @@ fn rebuild_index_on_existing_table() {
 
     // Rebuild the index from scratch
     let count: i64 = conn
-        .query_row(
-            "SELECT vector_rebuild_index('emb', 'float4', 'l2')",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT vector_rebuild_index('emb')", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 3);
 }
@@ -78,11 +74,7 @@ fn rebuild_index_empty_table() {
         .unwrap();
 
     let count: i64 = conn
-        .query_row(
-            "SELECT vector_rebuild_index('emb', 'float4', 'l2')",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT vector_rebuild_index('emb')", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
 }
@@ -93,8 +85,8 @@ fn export_and_import_arrow() {
     conn.execute_batch("CREATE VIRTUAL TABLE emb USING vector(dim=3, type=float4, metric=l2)")
         .unwrap();
 
-    let v1 = VectorType::Float4.slice_to_blob(&[1.0f32, 2.0, 3.0]);
-    let v2 = VectorType::Float4.slice_to_blob(&[4.0f32, 5.0, 6.0]);
+    let v1 = slice_to_blob(&[1.0f32, 2.0, 3.0]);
+    let v2 = slice_to_blob(&[4.0f32, 5.0, 6.0]);
 
     conn.execute("INSERT INTO emb(vector) VALUES(?)", [v1.as_slice()])
         .unwrap();
@@ -166,9 +158,9 @@ fn rebuild_index_preserves_shadow_data() {
     conn.execute_batch("CREATE VIRTUAL TABLE emb USING vector(dim=3, type=float4, metric=l2)")
         .unwrap();
 
-    let v1 = VectorType::Float4.slice_to_blob(&[1.0f32, 0.0, 0.0]);
-    let v2 = VectorType::Float4.slice_to_blob(&[0.0f32, 1.0, 0.0]);
-    let v3 = VectorType::Float4.slice_to_blob(&[0.0f32, 0.0, 1.0]);
+    let v1 = slice_to_blob(&[1.0f32, 0.0, 0.0]);
+    let v2 = slice_to_blob(&[0.0f32, 1.0, 0.0]);
+    let v3 = slice_to_blob(&[0.0f32, 0.0, 1.0]);
 
     conn.execute("INSERT INTO emb(vector) VALUES(?)", [v1.as_slice()])
         .unwrap();
@@ -178,11 +170,9 @@ fn rebuild_index_preserves_shadow_data() {
         .unwrap();
 
     // Rebuild the HNSW index
-    conn.query_row(
-        "SELECT vector_rebuild_index('emb', 'float4', 'l2')",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
+    conn.query_row("SELECT vector_rebuild_index('emb')", [], |row| {
+        row.get::<_, i64>(0)
+    })
     .unwrap();
 
     // KNN search should still work after rebuild — but note the in-memory

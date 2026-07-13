@@ -1,6 +1,7 @@
+use std::borrow::Cow;
 use std::fmt;
 
-use bytemuck::{Pod, cast_slice};
+use bytemuck::{Pod, cast_slice, pod_read_unaligned};
 use half::f16;
 
 /// Errors from vector type operations.
@@ -24,6 +25,26 @@ impl fmt::Display for VectorTypeError {
 }
 
 impl std::error::Error for VectorTypeError {}
+
+/// Cast a byte blob to a typed slice, tolerating misaligned input.
+///
+/// SQLite blob pointers and `Vec<u8>` buffers are not guaranteed to be
+/// aligned for T; fall back to an owned copy when they are not.
+pub fn cast_blob<T: Pod>(blob: &[u8]) -> Cow<'_, [T]> {
+    match bytemuck::try_cast_slice::<u8, T>(blob) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(
+            blob.chunks_exact(std::mem::size_of::<T>())
+                .map(pod_read_unaligned)
+                .collect(),
+        ),
+    }
+}
+
+/// Encode a typed slice to a byte blob. The inverse of [`cast_blob`].
+pub fn slice_to_blob<T: Pod>(values: &[T]) -> Vec<u8> {
+    cast_slice(values).to_vec()
+}
 
 /// Supported vector element types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,19 +107,19 @@ impl VectorType {
         self.validate_blob(blob, dim)?;
         match self {
             Self::Float2 => {
-                let values: &[f16] = cast_slice(blob);
+                let values = cast_blob::<f16>(blob);
                 if values.iter().any(|v| !v.is_finite()) {
                     return Err(VectorTypeError::NonFiniteValue);
                 }
             }
             Self::Float4 => {
-                let values: &[f32] = cast_slice(blob);
+                let values = cast_blob::<f32>(blob);
                 if values.iter().any(|v| !v.is_finite()) {
                     return Err(VectorTypeError::NonFiniteValue);
                 }
             }
             Self::Float8 => {
-                let values: &[f64] = cast_slice(blob);
+                let values = cast_blob::<f64>(blob);
                 if values.iter().any(|v| !v.is_finite()) {
                     return Err(VectorTypeError::NonFiniteValue);
                 }
@@ -106,17 +127,6 @@ impl VectorType {
             Self::Int1 | Self::Int2 | Self::Int4 => {} // integers are always finite
         }
         Ok(())
-    }
-
-    /// Cast a typed slice to a byte blob. Generic helper.
-    pub fn slice_to_blob<T: Pod>(&self, values: &[T]) -> Vec<u8> {
-        cast_slice(values).to_vec()
-    }
-
-    /// Cast a byte blob back to a typed slice. Generic helper.
-    /// Caller must ensure the blob was created with the matching type.
-    pub fn blob_to_slice<'a, T: Pod>(&self, blob: &'a [u8]) -> &'a [T] {
-        cast_slice(blob)
     }
 
     /// Returns true if this is a float type (has NaN/Inf concerns).
@@ -282,14 +292,14 @@ mod tests {
     #[test]
     fn validate_finite_all_finite_f32_ok() {
         let values: Vec<f32> = vec![1.0, -2.5, 0.0, f32::MAX];
-        let blob = VectorType::Float4.slice_to_blob(&values);
+        let blob = slice_to_blob(&values);
         assert!(VectorType::Float4.validate_finite(&blob, 4).is_ok());
     }
 
     #[test]
     fn validate_finite_nan_f32_errors() {
         let values: Vec<f32> = vec![1.0, f32::NAN, 3.0];
-        let blob = VectorType::Float4.slice_to_blob(&values);
+        let blob = slice_to_blob(&values);
         assert_eq!(
             VectorType::Float4.validate_finite(&blob, 3).unwrap_err(),
             VectorTypeError::NonFiniteValue
@@ -299,7 +309,7 @@ mod tests {
     #[test]
     fn validate_finite_inf_f32_errors() {
         let values: Vec<f32> = vec![1.0, f32::INFINITY];
-        let blob = VectorType::Float4.slice_to_blob(&values);
+        let blob = slice_to_blob(&values);
         assert_eq!(
             VectorType::Float4.validate_finite(&blob, 2).unwrap_err(),
             VectorTypeError::NonFiniteValue
@@ -309,7 +319,7 @@ mod tests {
     #[test]
     fn validate_finite_neg_inf_f64_errors() {
         let values: Vec<f64> = vec![0.0, f64::NEG_INFINITY];
-        let blob = VectorType::Float8.slice_to_blob(&values);
+        let blob = slice_to_blob(&values);
         assert_eq!(
             VectorType::Float8.validate_finite(&blob, 2).unwrap_err(),
             VectorTypeError::NonFiniteValue
@@ -319,14 +329,14 @@ mod tests {
     #[test]
     fn validate_finite_all_finite_f64_ok() {
         let values: Vec<f64> = vec![1.0, -2.5, 0.0, f64::MAX];
-        let blob = VectorType::Float8.slice_to_blob(&values);
+        let blob = slice_to_blob(&values);
         assert!(VectorType::Float8.validate_finite(&blob, 4).is_ok());
     }
 
     #[test]
     fn validate_finite_nan_f16_errors() {
         let values: Vec<f16> = vec![f16::from_f32(1.0), f16::NAN];
-        let blob = VectorType::Float2.slice_to_blob(&values);
+        let blob = slice_to_blob(&values);
         assert_eq!(
             VectorType::Float2.validate_finite(&blob, 2).unwrap_err(),
             VectorTypeError::NonFiniteValue
@@ -336,7 +346,7 @@ mod tests {
     #[test]
     fn validate_finite_inf_f16_errors() {
         let values: Vec<f16> = vec![f16::INFINITY];
-        let blob = VectorType::Float2.slice_to_blob(&values);
+        let blob = slice_to_blob(&values);
         assert_eq!(
             VectorType::Float2.validate_finite(&blob, 1).unwrap_err(),
             VectorTypeError::NonFiniteValue
@@ -346,16 +356,16 @@ mod tests {
     #[test]
     fn validate_finite_all_finite_f16_ok() {
         let values: Vec<f16> = vec![f16::from_f32(1.0), f16::from_f32(-0.5), f16::from_f32(0.0)];
-        let blob = VectorType::Float2.slice_to_blob(&values);
+        let blob = slice_to_blob(&values);
         assert!(VectorType::Float2.validate_finite(&blob, 3).is_ok());
     }
 
     #[test]
     fn validate_finite_integer_types_always_ok() {
         // Integer types never contain NaN/Inf; validate_finite should be a no-op.
-        let i8_blob = VectorType::Int1.slice_to_blob::<i8>(&[i8::MIN, 0, i8::MAX]);
-        let i16_blob = VectorType::Int2.slice_to_blob::<i16>(&[i16::MIN, 0, i16::MAX]);
-        let i32_blob = VectorType::Int4.slice_to_blob::<i32>(&[i32::MIN, 0, i32::MAX]);
+        let i8_blob = slice_to_blob::<i8>(&[i8::MIN, 0, i8::MAX]);
+        let i16_blob = slice_to_blob::<i16>(&[i16::MIN, 0, i16::MAX]);
+        let i32_blob = slice_to_blob::<i32>(&[i32::MIN, 0, i32::MAX]);
 
         assert!(VectorType::Int1.validate_finite(&i8_blob, 3).is_ok());
         assert!(VectorType::Int2.validate_finite(&i16_blob, 3).is_ok());
@@ -387,55 +397,55 @@ mod tests {
     #[test]
     fn round_trip_f32() {
         let original: Vec<f32> = vec![1.0, -2.5, 3.125, 0.0];
-        let blob = VectorType::Float4.slice_to_blob(&original);
+        let blob = slice_to_blob(&original);
         assert_eq!(blob.len(), original.len() * 4);
-        let recovered: &[f32] = VectorType::Float4.blob_to_slice(&blob);
-        assert_eq!(recovered, original.as_slice());
+        let recovered = cast_blob::<f32>(&blob);
+        assert_eq!(recovered.as_ref(), original.as_slice());
     }
 
     #[test]
     fn round_trip_f64() {
         let original: Vec<f64> = vec![1.0, -2.5, f64::MAX, f64::MIN_POSITIVE];
-        let blob = VectorType::Float8.slice_to_blob(&original);
+        let blob = slice_to_blob(&original);
         assert_eq!(blob.len(), original.len() * 8);
-        let recovered: &[f64] = VectorType::Float8.blob_to_slice(&blob);
-        assert_eq!(recovered, original.as_slice());
+        let recovered = cast_blob::<f64>(&blob);
+        assert_eq!(recovered.as_ref(), original.as_slice());
     }
 
     #[test]
     fn round_trip_f16() {
         let original: Vec<f16> = vec![f16::from_f32(1.0), f16::from_f32(-0.5), f16::from_f32(0.0)];
-        let blob = VectorType::Float2.slice_to_blob(&original);
+        let blob = slice_to_blob(&original);
         assert_eq!(blob.len(), original.len() * 2);
-        let recovered: &[f16] = VectorType::Float2.blob_to_slice(&blob);
-        assert_eq!(recovered, original.as_slice());
+        let recovered = cast_blob::<f16>(&blob);
+        assert_eq!(recovered.as_ref(), original.as_slice());
     }
 
     #[test]
     fn round_trip_i8() {
         let original: Vec<i8> = vec![i8::MIN, -1, 0, 1, i8::MAX];
-        let blob = VectorType::Int1.slice_to_blob(&original);
+        let blob = slice_to_blob(&original);
         assert_eq!(blob.len(), original.len());
-        let recovered: &[i8] = VectorType::Int1.blob_to_slice(&blob);
-        assert_eq!(recovered, original.as_slice());
+        let recovered = cast_blob::<i8>(&blob);
+        assert_eq!(recovered.as_ref(), original.as_slice());
     }
 
     #[test]
     fn round_trip_i16() {
         let original: Vec<i16> = vec![i16::MIN, -1, 0, 1, i16::MAX];
-        let blob = VectorType::Int2.slice_to_blob(&original);
+        let blob = slice_to_blob(&original);
         assert_eq!(blob.len(), original.len() * 2);
-        let recovered: &[i16] = VectorType::Int2.blob_to_slice(&blob);
-        assert_eq!(recovered, original.as_slice());
+        let recovered = cast_blob::<i16>(&blob);
+        assert_eq!(recovered.as_ref(), original.as_slice());
     }
 
     #[test]
     fn round_trip_i32() {
         let original: Vec<i32> = vec![i32::MIN, -1, 0, 1, i32::MAX];
-        let blob = VectorType::Int4.slice_to_blob(&original);
+        let blob = slice_to_blob(&original);
         assert_eq!(blob.len(), original.len() * 4);
-        let recovered: &[i32] = VectorType::Int4.blob_to_slice(&blob);
-        assert_eq!(recovered, original.as_slice());
+        let recovered = cast_blob::<i32>(&blob);
+        assert_eq!(recovered.as_ref(), original.as_slice());
     }
 
     // Verify that slice_to_blob produces the same bytes as bytemuck::cast_slice
@@ -444,7 +454,17 @@ mod tests {
     fn slice_to_blob_matches_bytemuck_cast_slice() {
         let values: Vec<f32> = vec![1.0_f32, 2.0, 3.0];
         let expected: &[u8] = cast_slice(&values);
-        let got = VectorType::Float4.slice_to_blob(&values);
+        let got = slice_to_blob(&values);
         assert_eq!(got.as_slice(), expected);
+    }
+
+    #[test]
+    fn cast_blob_handles_misaligned_input() {
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut padded = vec![0u8];
+        padded.extend_from_slice(cast_slice(&values));
+        let misaligned = &padded[1..]; // guaranteed misaligned for f32 (alloc + 1)
+        let out: std::borrow::Cow<'_, [f32]> = cast_blob(misaligned);
+        assert_eq!(out.as_ref(), values.as_slice());
     }
 }
