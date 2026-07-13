@@ -341,40 +341,36 @@ pub(crate) fn reconcile_index(
     let mut stmt = db.prepare(ids_vectors_sql)?;
     stmt.query(())?;
     let mut count: usize = 0;
-    // Accumulated during the single scan so the (rare) rebuild-from-scratch
-    // path below doesn't need to re-query `_data`. Memory is bounded by
-    // table size, but only on that rare path is it actually used — this is
-    // an acceptable trade for avoiding a second full scan on every connect.
-    let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
+    // Streaming: add missing keys incrementally without buffering the whole
+    // table. Only on the rare rebuild-from-scratch path below (count
+    // mismatch) do we pay for a second scan.
     while let Some(row) = stmt.next()? {
         count += 1;
         let id = row[0].get_i64();
-        let vector = row[1].get_blob()?.to_vec();
         if !index.contains(id as u64) {
-            index.add(id as u64, &vector).map_err(|e| {
+            let vector = row[1].get_blob()?;
+            index.add(id as u64, vector).map_err(|e| {
                 Error::Module(format!(
                     "reconcile of vector table '{}' failed: {e}",
                     config.table_name
                 ))
             })?;
         }
-        rows.push((id, vector));
     }
     if index.len() == count {
         return Ok(index);
     }
     // Graph holds keys that no longer exist in _data (deletes lost since the
-    // last persist): rebuild from scratch, reusing the rows collected above
-    // instead of re-querying `_data`.
-    let fresh = HnswIndex::new(
-        config.dim,
-        config.vtype,
-        config.metric,
-        Some(config.hnsw_params),
-    )
-    .map_err(|e| Error::Module(e.to_string()))?;
-    for (id, vector) in &rows {
-        fresh.add(*id as u64, vector).map_err(|e| {
+    // last persist): rebuild from scratch by re-querying `_data`.
+    let fresh = config
+        .new_index()
+        .map_err(|e| Error::Module(e.to_string()))?;
+    let mut stmt = db.prepare(ids_vectors_sql)?;
+    stmt.query(())?;
+    while let Some(row) = stmt.next()? {
+        let id = row[0].get_i64();
+        let vector = row[1].get_blob()?;
+        fresh.add(id as u64, vector).map_err(|e| {
             Error::Module(format!(
                 "reconcile of vector table '{}' failed: {e}",
                 config.table_name

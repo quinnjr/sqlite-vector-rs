@@ -123,7 +123,12 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
                     .as_ref()
                     .expect("checked above")
                     .load_from_buffer(buf)
-                    .map_err(|e| Error::Module(e.to_string()))?;
+                    .map_err(|e| {
+                        Error::Module(format!(
+                            "rollback of vector table '{}' failed: {e}",
+                            self.config.table_name
+                        ))
+                    })?;
             }
             s.dirty = false;
             // The restored snapshot equals `last_committed`, so there are no
@@ -147,13 +152,10 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
         // before propagating the error, so the table never serves from an
         // empty placeholder index.
         let mut s = self.state.borrow_mut();
-        let placeholder = HnswIndex::new(
-            self.config.dim,
-            self.config.vtype,
-            self.config.metric,
-            Some(self.config.hnsw_params),
-        )
-        .map_err(|e| Error::Module(e.to_string()))?;
+        let placeholder = self
+            .config
+            .new_index()
+            .map_err(|e| Error::Module(e.to_string()))?;
         let index = s
             .index
             .replace(placeholder)
@@ -178,7 +180,12 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
                     .as_ref()
                     .expect("checked Some at top of rollback")
                     .load_from_buffer(buf)
-                    .map_err(|load_err| Error::Module(load_err.to_string()))?;
+                    .map_err(|load_err| {
+                        Error::Module(format!(
+                            "rollback of vector table '{}' failed: {load_err}",
+                            self.config.table_name
+                        ))
+                    })?;
                 Err(e)
             }
         }
@@ -229,7 +236,12 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
                 .as_ref()
                 .expect("checked Some above")
                 .load_from_buffer(&self.snapshots[idx].1)
-                .map_err(|e| Error::Module(e.to_string()))?;
+                .map_err(|e| {
+                    Error::Module(format!(
+                        "savepoint rollback of '{}' failed: {e}",
+                        self.config.table_name
+                    ))
+                })?;
             // Keep the target's own snapshot (the savepoint stays open) and
             // drop the deeper ones.
             self.snapshots.truncate(idx + 1);
@@ -240,24 +252,31 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
         // stacked snapshot is deeper than the target, so all are discarded, and
         // the index is rebuilt from `_data` to match the state SQLite already
         // restored there.
-        self.snapshots.clear();
+        //
+        // Build the fresh index and reconcile it *before* touching
+        // `self.snapshots` or `s.index`: if either fallible step below errors,
+        // the stack and the state's current index are left untouched rather
+        // than destroyed ahead of a failure.
         let db = unsafe { &*self.db };
-        let mut s = self.state.borrow_mut();
-        let placeholder = HnswIndex::new(
-            self.config.dim,
-            self.config.vtype,
-            self.config.metric,
-            Some(self.config.hnsw_params),
-        )
-        .map_err(|e| Error::Module(e.to_string()))?;
+        let placeholder = self.config.new_index().map_err(|e| {
+            Error::Module(format!(
+                "savepoint rollback of '{}' failed: {e}",
+                self.config.table_name
+            ))
+        })?;
         // Reconcile a *fresh* empty index against `_data`: every current row is
         // (re)added from the shadow data, so any ghost/stale keys left by the
         // rolled-back writes are gone and the index exactly matches `_data`.
-        // `placeholder` is moved into `reconcile_index`; on error `s.index`
-        // still holds the pre-rollback index (never an empty placeholder),
-        // which the next connect/reconcile corrects.
-        let fresh = crate::vtab::reconcile_index(db, &self.config, placeholder, &self.ids_vectors_sql)?;
+        let fresh = crate::vtab::reconcile_index(db, &self.config, placeholder, &self.ids_vectors_sql)
+            .map_err(|e| {
+                Error::Module(format!(
+                    "savepoint rollback of '{}' failed: {e}",
+                    self.config.table_name
+                ))
+            })?;
+        let mut s = self.state.borrow_mut();
         s.index = Some(fresh);
+        self.snapshots.clear();
         Ok(())
     }
 }

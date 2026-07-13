@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::distance::DistanceMetric;
-use crate::index::HnswParams;
+use crate::index::{HnswIndex, HnswParams, IndexError};
 use crate::types::VectorType;
 
 #[derive(Debug)]
@@ -197,6 +197,14 @@ impl VectorTableConfig {
             ef_search,
         };
         Ok((dim, vtype, metric, params))
+    }
+
+    /// Construct a fresh, empty HNSW index matching this config's
+    /// dim/type/metric/HNSW params. Shared by every "rebuild the index from
+    /// `_data`" path (reconcile, rollback, savepoint rollback-to) so they
+    /// can't drift out of sync with each other.
+    pub(crate) fn new_index(&self) -> Result<HnswIndex, IndexError> {
+        HnswIndex::new(self.dim, self.vtype, self.metric, Some(self.hnsw_params))
     }
 
     pub fn vtab_schema(&self) -> String {
