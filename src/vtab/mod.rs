@@ -983,28 +983,11 @@ impl<'vtab> TransactionVTab<'vtab> for VectorTable<'vtab> {
     type Transaction = VectorTransaction;
 
     fn begin(&'vtab self) -> Result<Self::Transaction> {
-        // Snapshot the index as it stands at transaction start. This is the
-        // fallback target for `ROLLBACK TO <sp>` when the vtab never received
-        // an `xSavepoint` for `<sp>` — which happens whenever the savepoint was
-        // opened *before* the vtab's first write enrolled it in the
-        // transaction. In that case the vtab's snapshot stack has no entry for
-        // the target, and "undo everything after <sp>" means "restore the
-        // transaction's starting state", NOT the (possibly much older)
-        // connect-time `last_committed` snapshot.
-        let begin_base = match &self.state.borrow().index {
-            Some(index) => Some(
-                index
-                    .save_to_buffer()
-                    .map_err(|e| Error::Module(e.to_string()))?,
-            ),
-            None => None, // exact mode: no index to snapshot
-        };
         Ok(VectorTransaction {
             state: Arc::clone(&self.state),
             table_name: self.config.table_name.clone(),
             db: self.db,
             snapshots: Vec::new(),
-            begin_base,
             sync_every: self.config.sync_every,
             config: self.config.clone(),
             ids_vectors_sql: self.sql.ids_vectors.clone(),

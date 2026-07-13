@@ -33,11 +33,6 @@ pub struct VectorTransaction {
     /// Safety: valid for the vtab lifetime — SQLite keeps the connection alive.
     pub db: *const VTabConnection,
     pub snapshots: Vec<(i32, Vec<u8>)>,
-    /// Serialized index state as of transaction start (`begin`). Used as the
-    /// `rollback_to` fallback when the target savepoint predates the vtab's
-    /// enrollment in the transaction, so its snapshot was never captured.
-    /// `None` in exact mode (no index). See `begin()` for the rationale.
-    pub begin_base: Option<Vec<u8>>,
     pub sync_every: u64,
     pub config: VectorTableConfig,
     /// Prebuilt `SELECT id, vector FROM "<t>_data"` SQL, cloned from
@@ -204,33 +199,63 @@ impl sqlite3_ext::vtab::VTabTransaction for VectorTransaction {
     }
 
     fn release(&mut self, n: i32) -> Result<()> {
+        // Releasing savepoint `n` discards it and every deeper (higher-numbered,
+        // more recently pushed) savepoint. Outer savepoints have lower numbers.
         self.snapshots.retain(|(sp, _)| *sp < n);
         Ok(())
     }
 
     fn rollback_to(&mut self, n: i32) -> Result<()> {
-        // Nothing here mutates `state` — only `index` and `begin_base` are
-        // read — so a shared borrow suffices.
-        let s = self.state.borrow();
-        let Some(idx_ref) = &s.index else {
+        // SQLite numbers savepoints by depth: an outer savepoint has a *lower*
+        // number than the inner ones opened after it. `xRollbackTo(n)` restores
+        // the state captured when savepoint `n` was opened and discards all
+        // deeper savepoints.
+        //
+        // A savepoint opened *before* the vtab's first write in this
+        // transaction never got an `xSavepoint` call, so its number is below
+        // every key on our stack and we hold no snapshot for it. Matching on
+        // `sp >= n` (the old logic) would then wrongly grab a *deeper*
+        // snapshot; we must instead detect the exact target and, when it's
+        // absent, rebuild from the shadow data (which SQLite has already rolled
+        // back to the target state) — the same recovery `rollback()` uses.
+        if self.state.borrow().index.is_none() {
             // Exact mode: no HNSW graph to roll back.
             return Ok(());
-        };
-        if let Some(idx) = self.snapshots.iter().position(|(sp, _)| *sp >= n) {
-            idx_ref
+        }
+
+        if let Some(idx) = self.snapshots.iter().position(|(sp, _)| *sp == n) {
+            let s = self.state.borrow();
+            s.index
+                .as_ref()
+                .expect("checked Some above")
                 .load_from_buffer(&self.snapshots[idx].1)
                 .map_err(|e| Error::Module(e.to_string()))?;
+            // Keep the target's own snapshot (the savepoint stays open) and
+            // drop the deeper ones.
             self.snapshots.truncate(idx + 1);
-        } else if let Some(buf) = &self.begin_base {
-            // Target savepoint predates the vtab's first write in this
-            // transaction, so we never snapshotted it. "Undo everything after
-            // <sp>" therefore means "restore the transaction's starting
-            // state" — NOT the connect-time `last_committed`, which omits any
-            // rows committed by earlier transactions on this connection.
-            idx_ref
-                .load_from_buffer(buf)
-                .map_err(|e| Error::Module(e.to_string()))?;
+            return Ok(());
         }
+
+        // No snapshot for the target: it predates the vtab's enrollment. Every
+        // stacked snapshot is deeper than the target, so all are discarded, and
+        // the index is rebuilt from `_data` to match the state SQLite already
+        // restored there.
+        self.snapshots.clear();
+        let db = unsafe { &*self.db };
+        let mut s = self.state.borrow_mut();
+        let placeholder = HnswIndex::new(
+            self.config.dim,
+            self.config.vtype,
+            self.config.metric,
+            Some(self.config.hnsw_params),
+        )
+        .map_err(|e| Error::Module(e.to_string()))?;
+        // Reconcile a *fresh* empty index against `_data`: its `len() (0) !=
+        // count` always forces a full rebuild, so any ghost/stale keys left by
+        // the rolled-back writes are dropped. On error, the fresh (empty) index
+        // is already installed — recoverable on the next connect/reconcile.
+        let fresh = crate::vtab::reconcile_index(db, &self.config, placeholder, &self.ids_vectors_sql)?;
+        s.index = Some(fresh);
         Ok(())
     }
 }

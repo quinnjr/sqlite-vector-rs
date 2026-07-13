@@ -1042,6 +1042,67 @@ fn released_savepoint_does_not_corrupt_later_rollback_to() {
 }
 
 #[test]
+fn rollback_to_savepoint_opened_before_first_write_does_not_desync_index() {
+    // A savepoint opened before the vtab's first write in a transaction gets
+    // no xSavepoint call, so the vtab holds no snapshot for it. ROLLBACK TO
+    // that savepoint — while a *deeper*, post-enrollment savepoint sits on the
+    // snapshot stack — must still restore the in-memory index to the target
+    // state (rebuilding from the shadow data), not the deeper snapshot. A
+    // desync leaves a ghost key in the graph that collides with a reused rowid
+    // on the next insert.
+    let conn = open_with_extension();
+    conn.execute_batch("CREATE VIRTUAL TABLE t USING vector(dim=2, type=float4, metric=l2);")
+        .unwrap();
+    // Committed baseline (autocommit), present before any savepoint.
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[0.0, 0.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+
+    conn.execute_batch("SAVEPOINT s1").unwrap(); // before first write: no xSavepoint
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[1.0, 1.0]', 'float4'))",
+        [],
+    )
+    .unwrap(); // enrolls the vtab
+    conn.execute_batch("SAVEPOINT s2").unwrap(); // snapshotted (deeper)
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[2.0, 2.0]', 'float4'))",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch("ROLLBACK TO s1").unwrap();
+
+    // Index must reflect only the committed baseline row, matching _data.
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM (SELECT id FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 10)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "ROLLBACK TO s1 must undo r1 and r2 in the index");
+
+    // The proof the index is not desynced: a subsequent insert must not
+    // collide with a ghost key left behind by the rolled-back rows.
+    conn.execute_batch("RELEASE s1").unwrap();
+    conn.execute(
+        "INSERT INTO t(vector) VALUES (vector_from_json('[3.0, 3.0]', 'float4'))",
+        [],
+    )
+    .expect("post-rollback insert must not hit a ghost duplicate key");
+    let n2: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM (SELECT id FROM t WHERE knn_match(distance, vector_from_json('[0.0, 0.0]', 'float4')) LIMIT 10)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n2, 2, "baseline + the new row");
+}
+
+#[test]
 fn multiple_knn_match_constraints_are_rejected() {
     let conn = open_with_extension();
     conn.execute_batch(

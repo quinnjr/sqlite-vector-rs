@@ -439,7 +439,7 @@ fn vector_sync_index_disambiguates_same_named_tables_across_databases() {
 
 #[test]
 fn drop_and_recreate_same_name_does_not_leave_stale_registry_entry() {
-    // Finding 1: destroy() (DROP TABLE) must remove the registry entry for
+    // destroy() (DROP TABLE) must remove the registry entry for
     // the dropped table so a same-named table created afterwards is the
     // *only* match for its bare name — a stale dead-Weak entry under the
     // same key would otherwise make the fresh table look ambiguous.
@@ -464,7 +464,7 @@ fn drop_and_recreate_same_name_does_not_leave_stale_registry_entry() {
 
 #[test]
 fn drop_main_then_create_aux_same_name_resolves_unambiguously() {
-    // Finding 1: dropping main.t must remove its registry entry outright
+    // dropping main.t must remove its registry entry outright
     // (not just leave a dead Weak on the get() path) so a subsequently
     // created aux.t is the *sole* live entry for the bare name 't' —
     // resolving to aux.t's own "not supported for attached databases"
