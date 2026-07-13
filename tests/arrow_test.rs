@@ -1,5 +1,5 @@
 use sqlite_vector_rs::arrow_io::{arrow_ipc_to_vectors, vectors_to_arrow_ipc};
-use sqlite_vector_rs::types::VectorType;
+use sqlite_vector_rs::types::{VectorType, slice_to_blob};
 
 #[test]
 fn round_trip_float4_vectors() {
@@ -8,10 +8,7 @@ fn round_trip_float4_vectors() {
         vec![4.0, 5.0, 6.0],
         vec![7.0, 8.0, 9.0],
     ];
-    let blobs: Vec<Vec<u8>> = vectors
-        .iter()
-        .map(|v| VectorType::Float4.slice_to_blob(v))
-        .collect();
+    let blobs: Vec<Vec<u8>> = vectors.iter().map(|v| slice_to_blob(v)).collect();
 
     let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Float4, 3).unwrap();
     assert!(!ipc.is_empty());
@@ -26,10 +23,7 @@ fn round_trip_float4_vectors() {
 #[test]
 fn round_trip_int1_vectors() {
     let vectors: Vec<Vec<i8>> = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]];
-    let blobs: Vec<Vec<u8>> = vectors
-        .iter()
-        .map(|v| VectorType::Int1.slice_to_blob(v))
-        .collect();
+    let blobs: Vec<Vec<u8>> = vectors.iter().map(|v| slice_to_blob(v)).collect();
 
     let ipc = vectors_to_arrow_ipc(&blobs, VectorType::Int1, 4).unwrap();
     let restored = arrow_ipc_to_vectors(&ipc, VectorType::Int1, 4).unwrap();

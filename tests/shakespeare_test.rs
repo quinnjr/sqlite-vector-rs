@@ -2,7 +2,7 @@ mod common;
 
 use common::open_with_extension;
 use rusqlite::params;
-use sqlite_vector_rs::types::VectorType;
+use sqlite_vector_rs::types::{VectorType, slice_to_blob};
 
 /// Fixed dimension for our character-frequency feature vectors.
 /// We use 26 lowercase letter frequencies + 10 digit frequencies + 4 punctuation
@@ -99,7 +99,7 @@ fn shakespeare_pdf_to_vector_store() {
 
     for chunk in &chunks {
         let vec = text_to_vector(chunk);
-        let blob = VectorType::Float4.slice_to_blob(&vec);
+        let blob = slice_to_blob(&vec);
         conn.execute(
             "INSERT INTO shakespeare(vector) VALUES(?)",
             [blob.as_slice()],
@@ -115,7 +115,7 @@ fn shakespeare_pdf_to_vector_store() {
 
     // --- 4. KNN search for a passage similar to "to be or not to be" ---
     let query_vec = text_to_vector("to be or not to be that is the question");
-    let query_blob = VectorType::Float4.slice_to_blob(&query_vec);
+    let query_blob = slice_to_blob(&query_vec);
 
     let mut stmt = conn
         .prepare("SELECT id, distance FROM shakespeare WHERE knn_match(distance, ?) LIMIT 5")
@@ -196,7 +196,7 @@ fn populate_table(
     .unwrap();
     for chunk in &used {
         let vec = text_to_vector(chunk);
-        let blob = vtype.slice_to_blob(&vec);
+        let blob = slice_to_blob(&vec);
         conn.execute(
             &format!("INSERT INTO {name}(vector) VALUES(?)"),
             [blob.as_slice()],
@@ -216,8 +216,7 @@ fn shakespeare_l2_metric() {
     let conn = open_with_extension();
     let used = populate_table(&conn, "shk_l2", VectorType::Float4, "l2", &chunks, 150);
 
-    let query_blob =
-        VectorType::Float4.slice_to_blob(&text_to_vector("Romeo Romeo wherefore art thou Romeo"));
+    let query_blob = slice_to_blob(&text_to_vector("Romeo Romeo wherefore art thou Romeo"));
     let mut stmt = conn
         .prepare("SELECT id, distance FROM shk_l2 WHERE knn_match(distance, ?) LIMIT 3")
         .unwrap();
@@ -250,8 +249,7 @@ fn shakespeare_inner_product_metric() {
     let conn = open_with_extension();
     populate_table(&conn, "shk_ip", VectorType::Float4, "ip", &chunks, 100);
 
-    let query_blob = VectorType::Float4
-        .slice_to_blob(&text_to_vector("double double toil and trouble fire burn"));
+    let query_blob = slice_to_blob(&text_to_vector("double double toil and trouble fire burn"));
     let mut stmt = conn
         .prepare("SELECT id, distance FROM shk_ip WHERE knn_match(distance, ?) LIMIT 5")
         .unwrap();
@@ -286,7 +284,7 @@ fn shakespeare_float8_vectors() {
     for chunk in chunks.iter().take(n) {
         let f32_vec = text_to_vector(chunk);
         let f64_vec: Vec<f64> = f32_vec.iter().map(|&x| x as f64).collect();
-        let blob = VectorType::Float8.slice_to_blob(&f64_vec);
+        let blob = slice_to_blob(&f64_vec);
         conn.execute("INSERT INTO shk_f8(vector) VALUES(?)", [blob.as_slice()])
             .unwrap();
     }
@@ -299,7 +297,7 @@ fn shakespeare_float8_vectors() {
     // KNN search with float8
     let f32_q = text_to_vector("a midsummer nights dream");
     let f64_q: Vec<f64> = f32_q.iter().map(|&x| x as f64).collect();
-    let query_blob = VectorType::Float8.slice_to_blob(&f64_q);
+    let query_blob = slice_to_blob(&f64_q);
     let mut stmt = conn
         .prepare("SELECT id, distance FROM shk_f8 WHERE knn_match(distance, ?) LIMIT 3")
         .unwrap();
@@ -335,7 +333,7 @@ fn shakespeare_delete_and_search() {
     assert_eq!(count, (used.len() - 10) as i64);
 
     // KNN search should still work and not return deleted rows
-    let query_blob = VectorType::Float4.slice_to_blob(&text_to_vector("friends romans countrymen"));
+    let query_blob = slice_to_blob(&text_to_vector("friends romans countrymen"));
     let mut stmt = conn
         .prepare("SELECT id, distance FROM shk_del WHERE knn_match(distance, ?) LIMIT 5")
         .unwrap();
@@ -363,8 +361,8 @@ fn shakespeare_vector_distance_between_chunks() {
     let conn = open_with_extension();
 
     // Compute distance between two Shakespeare passages via SQL
-    let v1 = VectorType::Float4.slice_to_blob(&text_to_vector(&chunks[0]));
-    let v2 = VectorType::Float4.slice_to_blob(&text_to_vector(&chunks[1]));
+    let v1 = slice_to_blob(&text_to_vector(&chunks[0]));
+    let v2 = slice_to_blob(&text_to_vector(&chunks[1]));
 
     let dist: f64 = conn
         .query_row(
@@ -384,7 +382,7 @@ fn shakespeare_vector_distance_between_chunks() {
 fn shakespeare_vector_dims_matches() {
     let chunks = load_shakespeare_chunks();
     let conn = open_with_extension();
-    let blob = VectorType::Float4.slice_to_blob(&text_to_vector(&chunks[0]));
+    let blob = slice_to_blob(&text_to_vector(&chunks[0]));
 
     let dims: i64 = conn
         .query_row(
@@ -400,7 +398,7 @@ fn shakespeare_vector_dims_matches() {
 fn shakespeare_self_distance_is_zero() {
     let chunks = load_shakespeare_chunks();
     let conn = open_with_extension();
-    let blob = VectorType::Float4.slice_to_blob(&text_to_vector(&chunks[5]));
+    let blob = slice_to_blob(&text_to_vector(&chunks[5]));
 
     let dist: f64 = conn
         .query_row(
@@ -524,8 +522,7 @@ fn shakespeare_repeated_knn_is_stable() {
         100,
     );
 
-    let query_blob =
-        VectorType::Float4.slice_to_blob(&text_to_vector("shall I compare thee to a summers day"));
+    let query_blob = slice_to_blob(&text_to_vector("shall I compare thee to a summers day"));
 
     // Run the same KNN query twice — results must be identical
     let fetch = |conn: &rusqlite::Connection| -> Vec<(i64, f64)> {
@@ -566,8 +563,7 @@ fn shakespeare_knn_varying_k() {
     let n = 100;
     populate_table(&conn, "shk_k", VectorType::Float4, "cosine", &chunks, n);
 
-    let query_blob =
-        VectorType::Float4.slice_to_blob(&text_to_vector("the lady doth protest too much"));
+    let query_blob = slice_to_blob(&text_to_vector("the lady doth protest too much"));
 
     for k in [1, 5, 10, 50] {
         let sql = format!("SELECT id, distance FROM shk_k WHERE knn_match(distance, ?) LIMIT {k}");
@@ -618,7 +614,7 @@ fn shakespeare_different_queries_different_results() {
 
     let mut all_top_ids: Vec<Vec<i64>> = Vec::new();
     for q in &queries {
-        let query_blob = VectorType::Float4.slice_to_blob(&text_to_vector(q));
+        let query_blob = slice_to_blob(&text_to_vector(q));
         let mut stmt = conn
             .prepare("SELECT id FROM shk_diff WHERE knn_match(distance, ?) LIMIT 3")
             .unwrap();
@@ -695,8 +691,7 @@ fn shakespeare_file_backed_persistence() {
         assert_eq!(count, 40);
 
         // KNN still works after reopen
-        let query_blob =
-            VectorType::Float4.slice_to_blob(&text_to_vector("what light through yonder window"));
+        let query_blob = slice_to_blob(&text_to_vector("what light through yonder window"));
         let mut stmt = conn
             .prepare("SELECT id, distance FROM shk_file WHERE knn_match(distance, ?) LIMIT 3")
             .unwrap();
@@ -729,8 +724,7 @@ fn shakespeare_large_batch() {
     assert_eq!(count, used.len() as i64);
 
     // KNN on a bigger table
-    let query_blob =
-        VectorType::Float4.slice_to_blob(&text_to_vector("parting is such sweet sorrow"));
+    let query_blob = slice_to_blob(&text_to_vector("parting is such sweet sorrow"));
     let mut stmt = conn
         .prepare("SELECT id, distance FROM shk_large WHERE knn_match(distance, ?) LIMIT 10")
         .unwrap();

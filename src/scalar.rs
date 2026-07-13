@@ -29,26 +29,19 @@ fn blob_to_f64s(blob: &[u8], vtype: VectorType) -> Vec<f64> {
 
 /// Helper: encode f64 values back to blob for any vector type
 fn f64s_to_blob(values: &[f64], vtype: VectorType) -> Vec<u8> {
+    use crate::types::slice_to_blob;
     match vtype {
-        VectorType::Float2 => vtype.slice_to_blob(
+        VectorType::Float2 => slice_to_blob(
             &values
                 .iter()
                 .map(|v| half::f16::from_f64(*v))
                 .collect::<Vec<_>>(),
         ),
-        VectorType::Float4 => {
-            vtype.slice_to_blob(&values.iter().map(|v| *v as f32).collect::<Vec<_>>())
-        }
-        VectorType::Float8 => vtype.slice_to_blob(values),
-        VectorType::Int1 => {
-            vtype.slice_to_blob(&values.iter().map(|v| *v as i8).collect::<Vec<_>>())
-        }
-        VectorType::Int2 => {
-            vtype.slice_to_blob(&values.iter().map(|v| *v as i16).collect::<Vec<_>>())
-        }
-        VectorType::Int4 => {
-            vtype.slice_to_blob(&values.iter().map(|v| *v as i32).collect::<Vec<_>>())
-        }
+        VectorType::Float4 => slice_to_blob(&values.iter().map(|v| *v as f32).collect::<Vec<_>>()),
+        VectorType::Float8 => slice_to_blob(values),
+        VectorType::Int1 => slice_to_blob(&values.iter().map(|v| *v as i8).collect::<Vec<_>>()),
+        VectorType::Int2 => slice_to_blob(&values.iter().map(|v| *v as i16).collect::<Vec<_>>()),
+        VectorType::Int4 => slice_to_blob(&values.iter().map(|v| *v as i32).collect::<Vec<_>>()),
     }
 }
 
@@ -57,11 +50,7 @@ fn f64s_to_blob(values: &[f64], vtype: VectorType) -> Vec<u8> {
 /// match, combines each lane pair with `op`, and re-encodes the result in
 /// the input element type. Shared by `vector_add` and `vector_sub`, which
 /// differ only in `op`.
-fn register_binary_elementwise(
-    db: &Connection,
-    name: &str,
-    op: fn(f64, f64) -> f64,
-) -> Result<()> {
+fn register_binary_elementwise(db: &Connection, name: &str, op: fn(f64, f64) -> f64) -> Result<()> {
     db.create_scalar_function(
         name,
         &FunctionOptions::default()
@@ -616,7 +605,7 @@ pub fn register_scalar_functions(db: &Connection, registry: Registry) -> Result<
                     .map(|v| (v * scale).round().clamp(-127.0, 127.0) as i8)
                     .collect()
             };
-            ctx.set_result(&VectorType::Int1.slice_to_blob(&out)[..])?;
+            ctx.set_result(&crate::types::slice_to_blob(&out)[..])?;
             Ok(())
         },
     )?;

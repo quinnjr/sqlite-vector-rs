@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use common::open_with_extension;
 use rusqlite::params;
-use sqlite_vector_rs::types::VectorType;
+use sqlite_vector_rs::types::slice_to_blob;
 
 use llama_gguf::backend::cpu::CpuBackend;
 use llama_gguf::model::embeddings::{EmbeddingConfig, EmbeddingExtractor};
@@ -184,7 +184,7 @@ fn store_real_embeddings_and_knn_search() {
     let mut blobs: Vec<Vec<u8>> = Vec::new();
     for passage in PASSAGES {
         let emb = embed(&mut bundle, passage);
-        let blob = VectorType::Float4.slice_to_blob(&emb);
+        let blob = slice_to_blob(&emb);
         conn.execute("INSERT INTO docs(vector) VALUES(?)", [blob.as_slice()])
             .unwrap();
         blobs.push(blob);
@@ -198,7 +198,7 @@ fn store_real_embeddings_and_knn_search() {
 
     // KNN search for a query related to Hamlet.
     let query_emb = embed(&mut bundle, "the question of existence and mortality");
-    let query_blob = VectorType::Float4.slice_to_blob(&query_emb);
+    let query_blob = slice_to_blob(&query_emb);
 
     let mut stmt = conn
         .prepare("SELECT id, distance FROM docs WHERE knn_match(distance, ?) LIMIT 3")
@@ -246,14 +246,14 @@ fn rag_retrieve_and_generate() {
     // Insert passages.
     for passage in PASSAGES {
         let emb = embed(&mut bundle, passage);
-        let blob = VectorType::Float4.slice_to_blob(&emb);
+        let blob = slice_to_blob(&emb);
         conn.execute("INSERT INTO rag(vector) VALUES(?)", [blob.as_slice()])
             .unwrap();
     }
 
     // Retrieve top-3 passages for a Hamlet-related query.
     let query_emb = embed(&mut bundle, "what does it mean to exist");
-    let query_blob = VectorType::Float4.slice_to_blob(&query_emb);
+    let query_blob = slice_to_blob(&query_emb);
 
     let mut stmt = conn
         .prepare("SELECT id, distance FROM rag WHERE knn_match(distance, ?) LIMIT 3")

@@ -2,7 +2,7 @@ mod common;
 
 use common::open_with_extension;
 use rusqlite::params;
-use sqlite_vector_rs::types::VectorType;
+use sqlite_vector_rs::types::slice_to_blob;
 
 #[test]
 fn create_virtual_table() {
@@ -17,9 +17,9 @@ fn insert_and_full_scan() {
     conn.execute_batch("CREATE VIRTUAL TABLE emb USING vector(dim=3, type=float4, metric=l2)")
         .unwrap();
 
-    let v1 = VectorType::Float4.slice_to_blob(&[1.0f32, 0.0, 0.0]);
-    let v2 = VectorType::Float4.slice_to_blob(&[0.0f32, 1.0, 0.0]);
-    let v3 = VectorType::Float4.slice_to_blob(&[0.0f32, 0.0, 1.0]);
+    let v1 = slice_to_blob(&[1.0f32, 0.0, 0.0]);
+    let v2 = slice_to_blob(&[0.0f32, 1.0, 0.0]);
+    let v3 = slice_to_blob(&[0.0f32, 0.0, 1.0]);
 
     conn.execute("INSERT INTO emb(vector) VALUES(?)", [v1.as_slice()])
         .unwrap();
@@ -41,7 +41,7 @@ fn reject_wrong_dimension() {
     conn.execute_batch("CREATE VIRTUAL TABLE emb USING vector(dim=3, type=float4, metric=l2)")
         .unwrap();
 
-    let wrong = VectorType::Float4.slice_to_blob(&[1.0f32, 0.0]); // 2-dim, expected 3
+    let wrong = slice_to_blob(&[1.0f32, 0.0]); // 2-dim, expected 3
     let result = conn.execute("INSERT INTO emb(vector) VALUES(?)", [wrong.as_slice()]);
     assert!(result.is_err());
 }
@@ -52,7 +52,7 @@ fn reject_nan() {
     conn.execute_batch("CREATE VIRTUAL TABLE emb USING vector(dim=3, type=float4, metric=l2)")
         .unwrap();
 
-    let with_nan = VectorType::Float4.slice_to_blob(&[1.0f32, f32::NAN, 3.0]);
+    let with_nan = slice_to_blob(&[1.0f32, f32::NAN, 3.0]);
     let result = conn.execute("INSERT INTO emb(vector) VALUES(?)", [with_nan.as_slice()]);
     assert!(result.is_err());
 }
@@ -64,9 +64,9 @@ fn knn_search() {
         .unwrap();
 
     // Insert 3 orthogonal unit vectors
-    let v1 = VectorType::Float4.slice_to_blob(&[1.0f32, 0.0, 0.0]);
-    let v2 = VectorType::Float4.slice_to_blob(&[0.0f32, 1.0, 0.0]);
-    let v3 = VectorType::Float4.slice_to_blob(&[0.0f32, 0.0, 1.0]);
+    let v1 = slice_to_blob(&[1.0f32, 0.0, 0.0]);
+    let v2 = slice_to_blob(&[0.0f32, 1.0, 0.0]);
+    let v3 = slice_to_blob(&[0.0f32, 0.0, 1.0]);
 
     conn.execute("INSERT INTO emb(vector) VALUES(?)", [v1.as_slice()])
         .unwrap();
@@ -76,7 +76,7 @@ fn knn_search() {
         .unwrap();
 
     // Query for nearest neighbor to [1, 0, 0] — should return v1 first
-    let query = VectorType::Float4.slice_to_blob(&[0.9f32, 0.1, 0.0]);
+    let query = slice_to_blob(&[0.9f32, 0.1, 0.0]);
     let mut stmt = conn
         .prepare("SELECT id, distance FROM emb WHERE knn_match(distance, ?) LIMIT 2")
         .unwrap();

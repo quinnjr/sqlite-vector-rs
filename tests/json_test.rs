@@ -1,11 +1,11 @@
 use sqlite_vector_rs::json::{blob_to_json, json_to_blob};
-use sqlite_vector_rs::types::VectorType;
+use sqlite_vector_rs::types::{VectorType, cast_blob, slice_to_blob};
 
 #[test]
 fn json_to_float4_blob() {
     let blob = json_to_blob("[1.0, 2.0, 3.0]", VectorType::Float4).unwrap();
-    let values: &[f32] = VectorType::Float4.blob_to_slice(&blob);
-    assert_eq!(values, &[1.0, 2.0, 3.0]);
+    let values = cast_blob::<f32>(&blob);
+    assert_eq!(values.as_ref(), &[1.0, 2.0, 3.0]);
 }
 
 #[test]
@@ -17,14 +17,14 @@ fn json_to_float2_blob() {
 #[test]
 fn json_to_int1_blob() {
     let blob = json_to_blob("[1, 2, -3]", VectorType::Int1).unwrap();
-    let values: &[i8] = VectorType::Int1.blob_to_slice(&blob);
-    assert_eq!(values, &[1, 2, -3]);
+    let values = cast_blob::<i8>(&blob);
+    assert_eq!(values.as_ref(), &[1, 2, -3]);
 }
 
 #[test]
 fn blob_to_json_float4() {
     let values: Vec<f32> = vec![1.5, 2.5, 3.5];
-    let blob = VectorType::Float4.slice_to_blob(&values);
+    let blob = slice_to_blob(&values);
     let json = blob_to_json(&blob, VectorType::Float4).unwrap();
     assert_eq!(json, "[1.5,2.5,3.5]");
 }

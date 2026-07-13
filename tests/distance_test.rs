@@ -1,10 +1,10 @@
 use sqlite_vector_rs::distance::{DistanceMetric, compute_distance};
-use sqlite_vector_rs::types::VectorType;
+use sqlite_vector_rs::types::{VectorType, slice_to_blob};
 
 #[test]
 fn l2_identical_vectors_float4() {
     let a: Vec<f32> = vec![1.0, 2.0, 3.0];
-    let blob_a = VectorType::Float4.slice_to_blob(&a);
+    let blob_a = slice_to_blob(&a);
     let dist =
         compute_distance(&blob_a, &blob_a, VectorType::Float4, DistanceMetric::L2, 3).unwrap();
     assert!((dist - 0.0).abs() < 1e-6);
@@ -14,8 +14,8 @@ fn l2_identical_vectors_float4() {
 fn l2_known_distance_float4() {
     let a: Vec<f32> = vec![1.0, 0.0, 0.0];
     let b: Vec<f32> = vec![0.0, 1.0, 0.0];
-    let blob_a = VectorType::Float4.slice_to_blob(&a);
-    let blob_b = VectorType::Float4.slice_to_blob(&b);
+    let blob_a = slice_to_blob(&a);
+    let blob_b = slice_to_blob(&b);
     let dist =
         compute_distance(&blob_a, &blob_b, VectorType::Float4, DistanceMetric::L2, 3).unwrap();
     // Squared L2: (1-0)^2 + (0-1)^2 + (0-0)^2 = 2.0
@@ -25,7 +25,7 @@ fn l2_known_distance_float4() {
 #[test]
 fn cosine_identical_float4() {
     let a: Vec<f32> = vec![1.0, 2.0, 3.0];
-    let blob_a = VectorType::Float4.slice_to_blob(&a);
+    let blob_a = slice_to_blob(&a);
     let dist = compute_distance(
         &blob_a,
         &blob_a,
@@ -41,8 +41,8 @@ fn cosine_identical_float4() {
 fn cosine_orthogonal_float4() {
     let a: Vec<f32> = vec![1.0, 0.0];
     let b: Vec<f32> = vec![0.0, 1.0];
-    let blob_a = VectorType::Float4.slice_to_blob(&a);
-    let blob_b = VectorType::Float4.slice_to_blob(&b);
+    let blob_a = slice_to_blob(&a);
+    let blob_b = slice_to_blob(&b);
     let dist = compute_distance(
         &blob_a,
         &blob_b,
@@ -59,8 +59,8 @@ fn cosine_orthogonal_float4() {
 fn inner_product_known_float4() {
     let a: Vec<f32> = vec![1.0, 2.0, 3.0];
     let b: Vec<f32> = vec![4.0, 5.0, 6.0];
-    let blob_a = VectorType::Float4.slice_to_blob(&a);
-    let blob_b = VectorType::Float4.slice_to_blob(&b);
+    let blob_a = slice_to_blob(&a);
+    let blob_b = slice_to_blob(&b);
     let dist = compute_distance(
         &blob_a,
         &blob_b,
@@ -91,7 +91,7 @@ fn parse_metric_names() {
 fn distance_dimension_mismatch() {
     let a: Vec<f32> = vec![1.0, 2.0, 3.0];
     let b: Vec<f32> = vec![1.0, 2.0];
-    let blob_a = VectorType::Float4.slice_to_blob(&a);
-    let blob_b = VectorType::Float4.slice_to_blob(&b);
+    let blob_a = slice_to_blob(&a);
+    let blob_b = slice_to_blob(&b);
     assert!(compute_distance(&blob_a, &blob_b, VectorType::Float4, DistanceMetric::L2, 3).is_err());
 }
