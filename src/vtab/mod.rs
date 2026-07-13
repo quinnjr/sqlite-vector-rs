@@ -73,9 +73,9 @@ pub struct VectorTable<'vtab> {
     /// connect/create time. `disconnect()` doesn't receive `Aux`, so this is
     /// how it can remove its own entry.
     registry: Registry,
-    /// Cached prepared statements for the `xUpdate` paths (spec 2.3): insert,
+    /// Cached prepared statements for the `xUpdate` paths: insert,
     /// insert-with-explicit-id, delete-by-rowid, fetch-by-id. `Statement` is
-    /// an owned struct with no connection lifetime (see global-constraints),
+    /// an owned struct with no connection lifetime,
     /// and `Statement::query`/`execute`/`insert` reset the statement and
     /// clear/rebind parameters on every call, so holding one across `update()`
     /// invocations and reusing it is safe as long as it's never touched from
