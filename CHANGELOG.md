@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.1 — 2026-07-13
+
+### Changed
+
+- Packaging: `tests/fixtures/*` (the LFS-tracked Shakespeare PDF) is excluded
+  from the published crate, shrinking the package. No code or API changes.
+
 ## 0.3.0 — 2026-07-12
 
 ### Fixed
